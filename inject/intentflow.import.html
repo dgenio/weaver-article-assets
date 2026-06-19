@@ -1,0 +1,158 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>IntentFlow: Governed LLM Agents With Auditable, Hash-Chained Traces</title><meta name="author" content="Diogo Santos"></head><body><article><h1>IntentFlow: Governed LLM Agents With Auditable, Hash-Chained Traces</h1>
+<p><em>A small declarative language that compiles agent intent into a governed plan — and proves, after the fact, that the run stayed inside its rules.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-intentflow.png" alt="IntentFlow: Governed LLM Agents With Auditable, Hash-Chained Traces">
+You wired up an LLM agent. It can read a GitHub issue, search the repo, draft a reply, and — because you were in a hurry — it can also post that reply and close the issue. You put the guardrails in the prompt: <em>&quot;Never close an issue. Always cite evidence. Ask a human if you&#39;re unsure.&quot;</em></p>
+<p>Then the model closed an issue.</p>
+<p>Not because it&#39;s evil. Because guardrails written in prose are suggestions, and a model under pressure from a cleverly worded issue body will occasionally treat your suggestions as optional. When your security reviewer asks <em>&quot;prove this agent never took a forbidden action,&quot;</em> you have... application logs you wrote yourself, in a format you invented, that the same code path produced. That&#39;s not proof. That&#39;s a diary.</p>
+<p>This is the gap <a href="https://github.com/dgenio/intentflow">IntentFlow</a> is built to close.</p>
+<h2>The problem, concretely</h2>
+<p>Most &quot;agent governance&quot; today lives in one of three places, and all three leak:</p>
+<ul>
+<li><strong>In the prompt.</strong> Prose the model is free to ignore. Auditable only by reading the final output and hoping.</li>
+<li><strong>In your application code.</strong> Real enforcement, but now your governance is tangled into the same Python that calls the model, and &quot;what was the agent allowed to do?&quot; is answered by reading a codebase.</li>
+<li><strong>In a framework&#39;s callback soup.</strong> You wire functions together; the policy lives in your head and your ad-hoc logging.</li>
+</ul>
+<p>What&#39;s missing is a place to write down <em>the envelope of acceptable behavior</em> — the evidence an agent must have, the actions it may take, the actions it absolutely may not, what forces a human in the loop, how its output gets checked — as a single reviewable artifact that is <strong>enforced outside the model</strong> and that produces <strong>a witness you can independently verify after the fact</strong>.</p>
+<h2>The idea in one paragraph</h2>
+<p>IntentFlow is a small declarative language. You write a <code>.iflow</code> file that states a goal&#39;s objective, its evidence requirements, its action policy, its verification rules, its uncertainty handling, and a typed output contract. A compiler lowers that file into a JSON execution plan. A 13-phase runtime executes the plan, routing every single tool call — including reading evidence off disk — through an <code>ActionGate</code> that consults the compiled policy and <em>never reads model output</em>, so the model cannot talk its way past it. Every run emits a hash-chained, optionally signed trace. And <code>intentflow audit</code> re-derives the rules from your source and proves the run stayed inside them, using only the source file and the trace — without trusting the runtime, the backend, or the model.</p>
+<p>The slogan in the README sums it up: <em>Python programs deterministic computation. IntentFlow programs governed cognition.</em></p>
+<h2>What an IntentFlow program looks like</h2>
+<p>Here is the repo&#39;s flagship example, <code>examples/opensource_triage.iflow</code>, trimmed to its governance core. This is the actual file, not a paraphrase:</p>
+<pre><code class="language-text">goal TriageGitHubIssue {
+  objective:
+    triage a GitHub issue safely and propose a maintainer-ready response
+
+  evidence:
+    require issue_body
+    require comments
+    require repo_context
+    optional related_issues
+    distrust unsupported_claims
+
+  actions:
+    allow read_issue
+    allow search_repo
+    allow draft_comment
+    require_approval post_comment
+    deny close_issue
+
+  verify:
+    require cites_evidence
+    require maintainer_safe_tone
+    require no_unverified_claims
+    check confidence &gt;= 0.65
+
+  uncertainty:
+    if confidence &lt; 0.65 ask_human
+    if missing_evidence ask_human
+    if security_risk block_action
+
+  output:
+    summary: string
+    likely_cause: string?
+    confidence: number
+    suggested_response: markdown
+    proposed_labels: list[string]
+}
+</code></pre>
+<p>Read top to bottom and you know exactly what this agent is permitted to do. <code>deny close_issue</code> is not advice — it&#39;s compiled into the action gate. <code>require_approval post_comment</code> means the outward action fails closed until something or someone grants approval. <code>check confidence &gt;= 0.65</code> is a machine check, not a vibe. The <code>output:</code> block is a typed contract the result is validated against.</p>
+<h2>How it works</h2>
+<p>The pipeline is short and each stage narrows the one below it:</p>
+<pre><code class="language-text">.iflow source -&gt; parser -&gt; analyzer (IFLOW diagnostics) -&gt; compiler -&gt;
+execution plan (JSON) -&gt; runtime (13-phase machine) -&gt; traced result -&gt;
+replay / audit
+</code></pre>
+<p>A few design choices are worth calling out because they&#39;re what make the audit step meaningful, not decorative:</p>
+<ol>
+<li><strong>The ActionGate sits outside the model.</strong> Denied or unlisted actions raise; approval-gated actions fail closed without a grant. Because the gate never reads model output, no amount of prompt injection negotiates with it.</li>
+<li><strong>Confidence is calibrated before rules fire.</strong> Backends report a raw confidence; the runtime applies the plan&#39;s calibration policy, and the uncertainty rules evaluate the <em>calibrated</em> number. Both land in the trace. (In simulate mode the raw 0.72 calibrates to 0.676 — more on why that matters below.)</li>
+<li><strong>Verification is typed, not assumed.</strong> Machine-checkable rules (<code>cites_evidence</code>, <code>requires_phrase</code>, threshold checks like <code>confidence &gt;= 0.7</code>) are evaluated against real state. Rules that need an LLM judge live in a <em>separate trust tier</em> and, without a judge, are recorded as <strong>skipped</strong> — never silently passed.</li>
+<li><strong>The trace is append-only and complete.</strong> Every phase, gate decision, escalation, and check lands in a hash-chained event log: each event stores <code>sha256(prev_hash || canonical(event))</code>. <code>--sign-trace</code> HMAC-seals the root so a key holder can <em>detect</em> tampering.</li>
+</ol>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/if-d1.png" alt="From .iflow source to an independently verifiable trace. Each layer narrows what the layer below may do; governance lives outside the model.">
+<em>From .iflow source to an independently verifiable trace. Each layer narrows what the layer below may do; governance lives outside the model.</em></p>
+<p>A run ends in exactly one of six statuses, and the exit code follows it. The crucial guarantee: a failed verification ends the run in <code>failed_verification</code> — the runtime <em>cannot</em> report it as <code>completed</code>, and the auditor&#39;s <code>S1</code> check exists specifically to catch any attempt to hide that.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/if-d2.png" alt="The same six-status outcome model the runtime guarantees — a failed check can never be reported as success.">
+<em>The same six-status outcome model the runtime guarantees — a failed check can never be reported as success.</em></p>
+<h2>Try it in 5 minutes</h2>
+<p>Core IntentFlow has <strong>zero runtime dependencies</strong>, and every command below runs offline, deterministically, with no API key. (It targets Python 3.10+.)</p>
+<pre><code class="language-bash">git clone https://github.com/dgenio/intentflow
+cd intentflow
+pip install -e .
+</code></pre>
+<p>Validate, explain, and run the flagship example:</p>
+<pre><code class="language-bash">intentflow validate examples/opensource_triage.iflow
+intentflow explain  examples/opensource_triage.iflow
+intentflow run      examples/opensource_triage.iflow \
+    --backend simulate --trace-dir traces
+</code></pre>
+<p>The run prints a summary like this (representative of a real run on v0.6.0):</p>
+<pre><code class="language-text">--- run summary ---
+  goal:               TriageGitHubIssue
+  status:             completed
+  backend:            simulate
+  confidence:         0.676
+  verification:       passed
+  uncertainty:        clear
+  trace id:           b9f44900...
+trace written to traces/TriageGitHubIssue-...json
+</code></pre>
+<p>Now verify it actually behaved. <code>audit</code> recompiles the source and proves the trace stayed inside the program&#39;s envelope:</p>
+<pre><code class="language-bash">intentflow audit examples/opensource_triage.iflow traces/TriageGitHubIssue-*.json
+</code></pre>
+<pre><code class="language-text">{
+  &quot;goal&quot;: &quot;TriageGitHubIssue&quot;,
+  &quot;conformant&quot;: true,
+  &quot;violations&quot;: []
+}
+AUDIT: CONFORMANT — the trace stayed inside the program&#39;s envelope
+</code></pre>
+<p>Want to see governance <em>bite</em>? Run the deliberately dangerous example. It allows a deploy action with no approval gate, so the analyzer warns (IFLOW010), the compiled risk profile is <code>high</code>, and at runtime <code>if security_risk block_action</code> fires:</p>
+<pre><code class="language-bash">intentflow run examples/high_risk_deploy.iflow --backend simulate
+# -&gt; status: blocked
+</code></pre>
+<p>The denied <code>write_database</code> action can never run regardless of what the model says.</p>
+<p>The same surface is available from Python — this snippet is straight out of the README and runs as-is:</p>
+<pre><code class="language-python">import intentflow
+
+program = intentflow.load(&quot;examples/opensource_triage.iflow&quot;)
+result = program.run(backend=&quot;simulate&quot;)
+assert result[&quot;status&quot;] == &quot;completed&quot;
+
+# register a Python function as a governed action (runs through the gate):
+program.register_tool(&quot;lookup_user&quot;, serves=(&quot;user_record&quot;,),
+                      handler=lambda src: &quot;enterprise plan&quot;)
+
+report = intentflow.audit_document(program.compile(), result)
+assert report[&quot;conformant&quot;]
+</code></pre>
+<p>Note that <code>register_tool</code> doesn&#39;t bypass governance — your Python function still runs <em>through the action gate</em>.</p>
+<h3>Why does confidence drop from 0.72 to 0.676?</h3>
+<p>That isn&#39;t a bug, it&#39;s the whole thesis in miniature. The <code>production_diagnosis.iflow</code> example sets its threshold at 0.7. In simulate mode the raw confidence is 0.72 — which would pass — but the calibration step shrinks it to 0.676, which lands <em>below</em> the bar, so the run deliberately ends <code>needs_human</code>. An unsure diagnosis must not auto-complete. The point of the simulator is to make that control structure — gating, calibration, verification, escalation, tracing — testable end to end with no network and no flakiness.</p>
+<h2>Honest limitations (it&#39;s pre-alpha)</h2>
+<p>IntentFlow is at version <strong>0.6.0</strong>, classified <strong>Pre-Alpha</strong>, with <strong>no CI pipeline yet</strong>. It&#39;s an experimental but genuinely working language — the repo ships ~<strong>233 tests</strong> that run with no network and no API keys — but you should know exactly what is and isn&#39;t there:</p>
+<ul>
+<li>The grammar is <strong>line-oriented</strong> with <strong>no compound conditions</strong> (no <code>if a and b</code>).</li>
+<li>Calibration today is a <strong>fixed shrinkage map</strong>, not a learned model (a learned map is on the roadmap).</li>
+<li><code>object</code> outputs are typed at the top level but <strong>untyped inside</strong>.</li>
+<li>Uncertainty primitives beyond <code>ask_human</code> / <code>block_action</code> are <strong>recorded but not executed</strong>.</li>
+<li>Side-effecting tools are <strong>governed but not yet executed</strong> — the gate decides, but actually performing outward writes is future work.</li>
+<li>Pipelines are <strong>linear</strong> (DAGs are on the roadmap).</li>
+</ul>
+<p>The simulator mocks cognition and never pretends otherwise. Real <code>openai</code> and <code>anthropic</code> backends exist and sit behind the identical governance path, plus a cassette-replay mode for deterministic CI without keys — but the conformance reference is the deterministic simulator.</p>
+<p>If you need a production agent governor today, this isn&#39;t it yet. If you want to <em>think clearly about</em> — and experiment with — what governed, auditable agent execution should look like, it&#39;s unusually concrete for its age.</p>
+<h2>Takeaways</h2>
+<ul>
+<li><strong>Governance belongs outside the model.</strong> Prose guardrails are suggestions; a compiled <code>deny</code> enforced by a gate that never reads model output is a rule.</li>
+<li><strong>A trace you produced isn&#39;t proof — a trace someone else can verify is.</strong> IntentFlow&#39;s auditor re-derives the rules from source and checks the run with only the source and the trace.</li>
+<li><strong>Calibrated uncertainty should be able to stop a run.</strong> Lowering 0.72 to 0.676 to trip a 0.7 threshold is a feature: an unsure agent escalates instead of bluffing.</li>
+<li><strong>You can try the entire control loop offline.</strong> Zero runtime deps, deterministic simulate backend, no API key — gating, verification, escalation, and audit all run on your laptop.</li>
+<li><strong>Set expectations: pre-alpha.</strong> Working and well-tested (~233 tests), but no CI yet, linear pipelines, fixed calibration, and side-effecting tools not yet executed.</li>
+</ul>
+<p>IntentFlow is part of the broader <strong>Weaver</strong> stack of composable tools for building and governing LLM systems — if this resonates, the sibling projects are worth a look too.</p>
+<h2>Try it and tell the author what breaks</h2>
+<p>The fastest way to pressure-test an idea like this is to throw a real goal at it. Clone the repo, write your own <code>.iflow</code> for an agent you actually run, and see whether <code>intentflow explain</code> says what you meant — then run it in simulate mode and audit the trace.</p>
+<p>If it&#39;s useful, <strong>star the repo</strong> so more people governing agents find it; if it isn&#39;t, the issue tracker is open and the maintainer is clearly in a build-fast, listen-hard phase.</p>
+<p>Repo: <strong><a href="https://github.com/dgenio/intentflow">https://github.com/dgenio/intentflow</a></strong></p>
+
+</article></body></html>

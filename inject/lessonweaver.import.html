@@ -1,0 +1,148 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Stop Your AI Agent Repeating the Same Mistake: Reviewed Skills with lessonweaver</title><meta name="author" content="Diogo Santos"></head><body><article><h1>Stop Your AI Agent Repeating the Same Mistake: Reviewed Skills with lessonweaver</h1>
+<p><em>A deterministic, human-gated tool that turns your agent&#39;s real failures into reviewed AGENTS.md, Claude, and Copilot instructions — no LLM in the loop.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-lessonweaver.png" alt="Stop Your AI Agent Repeating the Same Mistake: Reviewed Skills with lessonweaver">
+Your coding agent reviewed a pull request last Tuesday. It read the title and the description, said &quot;looks good,&quot; and approved it — without ever opening the diff. A human caught it, left a correction, and moved on.</p>
+<p>This Tuesday, a different PR, the same agent, the same mistake.</p>
+<p>That is the quiet tax of agentic workflows. The model has no durable memory of the corrections you keep making, so the same class of failure resurfaces week after week. You can paste a fix into your system prompt, but then you are hand-curating prompt sprawl with no provenance, no review, and no idea which line is still earning its keep.</p>
+<p><a href="https://github.com/dgenio/lessonweaver">lessonweaver</a> is a small Python tool that attacks exactly this loop. It mines your agent&#39;s execution traces for the mistakes it keeps repeating, puts a <strong>human review gate</strong> in front of every candidate, and exports the approved ones as the instruction formats your team already uses: <code>AGENTS.md</code> fragments, Claude skills and <code>CLAUDE.md</code> rules, GitHub Copilot instructions, Codex skill directories, and generic runtime snippets.</p>
+<p>Two things make it worth a look. First, <strong>the core is deterministic — there are no LLM calls</strong> in detection, review, linting, or retrieval. Second, <strong>nothing activates without a human approving it.</strong> This is deliberately <em>not</em> an agent that rewrites its own instructions.</p>
+<h2>The problem, stated concretely</h2>
+<p>Letting a model self-edit its instructions sounds efficient until you watch it happen. You get context poisoning (the agent reinforces its own bad habit), silent drift (instructions change with no audit trail), and skills that activate themselves with no one signing off. For anything touching production code, &quot;the agent decided to teach itself a new rule&quot; is not a sentence you want in a postmortem.</p>
+<p>The opposite extreme — humans manually noticing patterns and updating <code>AGENTS.md</code> by hand — does not scale and is wildly inconsistent. Most corrections never make it back into the agent&#39;s context at all.</p>
+<p>lessonweaver lives in the middle: machine detection of recurring failures, human approval of which ones become guidance, deterministic export into files you can diff and review like any other change.</p>
+<h2>The idea in one paragraph</h2>
+<p>A trace becomes governed guidance only after passing two gates. lessonweaver <code>detect</code>s candidate lessons from a recorded run (a <code>human_correction</code>, a failed evaluation, an error-then-retry, a workflow step that ran out of order). A human reviews each candidate through structured multiple-choice questions and either approves or rejects it. Approved lessons become <strong>skill cards</strong> that must pass a lint gate before they can be promoted to <code>active</code>. Only then can you export them — and even the export is diff-first, so it lands in your repo as a reviewable change, not a silent rewrite.</p>
+<h2>How it works</h2>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/lw-d1.png" alt="The lessonweaver loop: a trace becomes governed guidance only after two gates — human review and governed promotion. Nothing activates automatically.">
+<em>The lessonweaver loop: a trace becomes governed guidance only after two gates — human review and governed promotion. Nothing activates automatically.</em></p>
+<p>The pipeline is five explicit, scriptable steps — <code>detect → interview → answer → approve → export</code> — and detection is intentionally conservative. &quot;Boring&quot; traces with no failure signal produce <strong>zero</strong> candidates; the project prefers false negatives over noisy guidance. In the bundled detection corpus, a trace where a workflow validates in the correct order and nothing goes wrong is labeled <code>should_detect: false</code>, and the detector agrees.</p>
+<p>Here is the kind of trace it reads. This is the real <code>examples/traces/github_pr_review_failure.json</code> fixture — the diff-skipping PR review from the intro:</p>
+<pre><code class="language-json">{
+  &quot;trace_id&quot;: &quot;trace-gh-pr-review-001&quot;,
+  &quot;source&quot;: &quot;github_coding_agent&quot;,
+  &quot;task&quot;: &quot;Review pull request quality&quot;,
+  &quot;events&quot;: [
+    { &quot;id&quot;: &quot;e1&quot;, &quot;type&quot;: &quot;user_message&quot;, &quot;content&quot;: &quot;Please review this PR.&quot; },
+    { &quot;id&quot;: &quot;e2&quot;, &quot;type&quot;: &quot;assistant_message&quot;,
+      &quot;content&quot;: &quot;Looks good from title and description.&quot;,
+      &quot;metadata&quot;: { &quot;evidence&quot;: &quot;title_body_only&quot; } },
+    { &quot;id&quot;: &quot;e3&quot;, &quot;type&quot;: &quot;human_correction&quot;,
+      &quot;content&quot;: &quot;You did not inspect changed files/diff before reviewing.&quot;,
+      &quot;metadata&quot;: { &quot;required_step&quot;: &quot;inspect_diff&quot; } }
+  ],
+  &quot;outcome&quot;: &quot;corrected_by_human&quot;
+}
+</code></pre>
+<p>Running <code>detect</code> on it surfaces a single candidate, scored and explained:</p>
+<pre><code class="language-json">{
+  &quot;id&quot;: &quot;trace-gh-pr-review-001-human-correction&quot;,
+  &quot;confidence&quot;: 0.62,
+  &quot;evidence_strength&quot;: 0.7,
+  &quot;evidence_event_ids&quot;: [&quot;e3&quot;],
+  &quot;evidence_summary&quot;: &quot;A human correction event is direct, first-hand evidence
+    that the agent&#39;s behavior needed fixing before it was acceptable.&quot;,
+  &quot;observed_problem&quot;: &quot;Agent required explicit human correction before reaching
+    acceptable behavior.&quot;,
+  &quot;recommended_action_type&quot;: &quot;skill&quot;,
+  &quot;risk_level&quot;: &quot;medium&quot;,
+  &quot;status&quot;: &quot;candidate&quot;
+}
+</code></pre>
+<p>Notice what is <em>not</em> there: no autogenerated prose pretending to be a finished rule. The candidate points back at the exact evidence event (<code>e3</code>) and waits for a human.</p>
+<h2>Try it in 5 minutes</h2>
+<p>lessonweaver targets Python 3.10+. The first PyPI release is still being prepared, so today you install from source. (Once published, the user install becomes <code>pip install lessonweaver</code>.)</p>
+<pre><code class="language-bash">git clone https://github.com/dgenio/lessonweaver
+cd lessonweaver
+pip install -e &quot;.[dev]&quot;
+lessonweaver --help
+</code></pre>
+<p>Now run the full loop against the bundled PR-review trace, writing to a throwaway registry so you do not touch your home directory:</p>
+<pre><code class="language-bash"># 1. Detect candidates from a trace and save them
+lessonweaver detect examples/traces/github_pr_review_failure.json \
+  --save --registry-root /tmp/lw
+
+# 2. Generate the human-review questions
+lessonweaver interview trace-gh-pr-review-001-human-correction \
+  --registry-root /tmp/lw
+
+# 3. Record a review decision (this is the human gate)
+lessonweaver answer trace-gh-pr-review-001-human-correction decision approve \
+  --free-text &quot;Diff inspection is required before review conclusions.&quot; \
+  --registry-root /tmp/lw
+
+# 4. Approve it into an operational lesson and skill
+lessonweaver approve trace-gh-pr-review-001-human-correction \
+  --approved-by reviewer --registry-root /tmp/lw
+
+# 5. Export the reviewed skill for an instruction surface
+lessonweaver export-skill skill-trace-gh-pr-review-001-human-correction \
+  --format markdown --redact --registry-root /tmp/lw
+</code></pre>
+<p>The approve step is a real gate, not a formality. As of v0.4.0, <code>approve</code> <strong>refuses to run</strong> until the required review questions are answered:</p>
+<pre><code>Error: cannot approve &#39;cand-1&#39;: review is incomplete; unanswered required
+questions: scope, action_type, ... Answer them with `lessonweaver answer`,
+or pass --allow-incomplete-review to override.
+</code></pre>
+<p>If you bypass it with <code>--allow-incomplete-review</code>, the override and the unanswered questions are recorded in the skill metadata, so the shortcut is auditable.</p>
+<p>The exported skill is plain, reviewable Markdown — the kind of thing you would actually want in <code>AGENTS.md</code>:</p>
+<pre><code class="language-markdown"># PR Diff-First Review Discipline
+
+## Description
+Always inspect changed files/diff before delivering review conclusions.
+
+## Instructions
+- Fetch and inspect changed files first.
+- Base review findings on concrete diff evidence.
+- If diff is unavailable, state limitation and avoid definitive approval.
+
+## Anti-patterns
+- Approving based only on PR title/body.
+
+## Evidence
+- trace: trace-gh-pr-review-001
+</code></pre>
+<p>Swap <code>--format markdown</code> for <code>claude</code>, <code>copilot</code>, <code>agents-md</code>, or <code>codex</code> to target a different tool. And rather than print-and-paste, <code>export-file</code> inserts the skill into a real file behind id-keyed sentinels, previewing a unified diff by default and writing only with <code>--write</code> — re-running an unchanged export reports <code>no changes</code> instead of appending a duplicate.</p>
+<h3>Closing the loop at runtime</h3>
+<p>Export to a file is one consumer; loading directly into an agent&#39;s context is the other. The runtime facade is a few lines:</p>
+<pre><code class="language-python">from lessonweaver import FileSystemRegistry, SkillLoader
+
+loader = SkillLoader(registry=FileSystemRegistry())
+context = loader.load_for_task(
+    task=&quot;Review this PR for security issues&quot;,
+    agent_type=&quot;coding&quot;,
+    tools=[&quot;github&quot;],
+    budget_chars=2000,
+)
+print(context.snippet)
+</code></pre>
+<p><code>load_for_task</code> does lexical retrieval against your reviewed skills, respects a character budget, and returns a compiled snippet you prepend to the agent&#39;s prompt. The repo&#39;s <code>closed_loop_contextweaver</code> example runs this end to end and prints exactly what the agent now starts with:</p>
+<pre><code>[Skill] Run the test suite before merging: Run the full test suite and
+confirm it passes before merging any pull request.
+</code></pre>
+<p>That is the whole point: the next run starts already knowing the thing a human had to teach it last time.</p>
+<h2>Honest limitations</h2>
+<p>This is early software, and the README does not pretend otherwise. Setting expectations fairly:</p>
+<ul>
+<li><strong>Maturity:</strong> version <code>0.4.0</code>, classified <code>Development Status :: 3 - Alpha</code>, and <strong>not yet on PyPI</strong> — you install from source today. It does carry a real test suite (283 test functions across 24 files) and CI, lint, and strict-mypy gates.</li>
+<li><strong>You bring the traces.</strong> lessonweaver consumes a documented JSON trace format; it does not instrument your agent for you. Getting runs into that format is your job (sibling tools and adapters help — see below).</li>
+<li><strong>Detection is rule-based and conservative by design.</strong> It catches signals like human corrections, failed evaluations, error-retries, and out-of-order workflow steps. Subtle or novel failure modes will slip through — that is the deliberate trade for not flooding you with noise.</li>
+<li><strong>The redactor is a safety net, not a compliance control.</strong> <code>SimpleRedactor</code> is best-effort scrubbing before export; treat trace content as potentially sensitive and do not rely on it for regulated data.</li>
+<li><strong>It is not an agent framework, an eval runner, or an observability product.</strong> It complements those; it does not replace them.</li>
+</ul>
+<h2>Part of a bigger stack</h2>
+<p>lessonweaver is the <em>learning loop</em> of the <strong>Weaver Stack</strong>. Sibling projects produce the evidence — <strong>agent-kernel</strong> emits ActionTraces, <strong>ChainWeaver</strong> surfaces flow failures, <strong>vibeguard</strong> produces findings — and lessonweaver turns that evidence into reviewed, governed guidance. On the consuming side, <strong>contextweaver</strong> can load the exported skill cards straight into an agent&#39;s context.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/lw-d2.png" alt="Where lessonweaver sits in the Weaver Stack: siblings produce evidence, lessonweaver turns it into reviewed guidance, and that guidance feeds back into agents.">
+<em>Where lessonweaver sits in the Weaver Stack: siblings produce evidence, lessonweaver turns it into reviewed guidance, and that guidance feeds back into agents.</em></p>
+<p>Crucially, it <strong>works standalone</strong>. It consumes any trace in the documented format and takes no hard runtime dependency on any sibling — the stack is a convenience, not a lock-in.</p>
+<h2>Takeaways</h2>
+<ul>
+<li>AI agents repeat corrected mistakes because corrections rarely make it back into durable context. lessonweaver closes that loop.</li>
+<li>It is <strong>deterministic and human-gated</strong>: no LLM in the core, and no skill goes live without a person approving it and it passing a lint gate.</li>
+<li>The flow is five scriptable steps — <code>detect → interview → answer → approve → export</code> — and detection is conservative, so boring traces yield zero candidates.</li>
+<li>Output targets the formats you already use: <code>AGENTS.md</code>, Claude/<code>CLAUDE.md</code>, Copilot, Codex, and runtime snippets, with diff-first file writes.</li>
+<li>It is <strong>alpha (<code>0.4.0</code>, install from source)</strong> but has a genuine test suite and CI gates, and it is honest about what it is not.</li>
+</ul>
+<h2>Try it and tell the maintainers what breaks</h2>
+<p>If you run coding, voice, or specialist agents and you are tired of re-teaching the same lessons, clone <a href="https://github.com/dgenio/lessonweaver">github.com/dgenio/lessonweaver</a>, run the five-minute loop above against your own traces, and open an issue with what the detector missed. Early-stage projects are shaped by exactly that feedback — and a star helps other people find it.</p>
+
+</article></body></html>

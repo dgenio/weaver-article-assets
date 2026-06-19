@@ -1,0 +1,160 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>AgentFence: A Local MCP Policy Firewall for AI Agent Tool Calls</title><meta name="author" content="Diogo Santos"></head><body><article><h1>AgentFence: A Local MCP Policy Firewall for AI Agent Tool Calls</h1>
+<p><em>Your coding agent can now touch your filesystem, GitHub, and shell. AgentFence is a single Go binary that decides allow, deny, or ask before any of it runs — no cloud, no telemetry.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-agentfence.png" alt="AgentFence: A Local MCP Policy Firewall for AI Agent Tool Calls">
+Your AI coding agent just asked to write a file. The path is <code>.env</code>. The content is <code>OPENAI_API_KEY=sk-...</code>.</p>
+<p>Did you mean for that to happen? Probably not. But the agent doesn&#39;t know that, and the MCP server on the other end will happily oblige. Modern tool-using agents get handed real capabilities — your filesystem, your GitHub account, your shell, your internal APIs — and the gap between &quot;the model decided to call a tool&quot; and &quot;the tool ran&quot; is usually zero. A prompt injection buried in a fetched web page, a hallucinated <code>rm -rf</code>, a secret copied into a log: all of it executes at machine speed, and your only record afterward is whatever the agent felt like printing.</p>
+<p><a href="https://github.com/dgenio/agentfence">AgentFence</a> is a small answer to that problem: a local policy gate that sits in front of tool calls and decides whether each one is <strong>allowed, denied, or sent for approval</strong> — before anything executes. It&#39;s a single Go binary you run yourself. No SaaS, no account, no telemetry. The policy is yours and the audit log is yours.</p>
+<p>This is a practical walkthrough: the problem, how the gate works, and a five-minute hands-on with code copied straight from the repo. AgentFence is early-stage (v0.7.0 at the time of writing), so I&#39;ll also be specific about what it does <em>not</em> do.</p>
+<h2>The problem, concretely</h2>
+<p>Three failure modes show up over and over with tool-capable agents:</p>
+<ul>
+<li><strong>Destructive actions done too fast.</strong> <code>github.delete_repo</code>, a force-push, <code>rm -rf</code> — irreversible calls fire before a human can react.</li>
+<li><strong>Prompt injection turning into tool calls.</strong> Untrusted content (a web page, an issue body, a file) carries instructions that steer the agent into a call it shouldn&#39;t make.</li>
+<li><strong>Secrets leaking into logs.</strong> Arguments containing API keys and tokens get written verbatim into whatever trace the tooling keeps.</li>
+</ul>
+<p>There&#39;s a wave of hosted &quot;agent security gateways&quot; aiming at this. The catch is the same one you always get with a SaaS control plane: your tool calls — which contain your code, your prompts, and sometimes your secrets — now flow through someone else&#39;s cloud. For a security control specifically, that&#39;s an awkward trade. AgentFence takes the opposite stance: run the gate locally, keep everything on your machine, and make the whole thing auditable by design.</p>
+<h2>The idea in one paragraph</h2>
+<p>Put a policy engine between the agent and its tools. Every tool call is matched against a YAML policy that yields one of three decisions — <code>allow</code>, <code>deny</code>, or <code>ask</code> — plus a human-readable reason. The default is <strong>deny</strong>: you opt calls <em>in</em>, not out. Constraints can narrow a rule further (which paths, which repos, which URLs, which executables). Sensitive-looking values are redacted before anything is written. And every decision lands in an append-only, hash-chained audit log you can verify offline. That&#39;s the whole model — boring on purpose, which is what you want from a security control.</p>
+<h2>How it works</h2>
+<p>AgentFence runs in two shapes from the same binary:</p>
+<ul>
+<li><strong>Batch <code>check</code> mode</strong> evaluates a JSONL stream of recorded tool calls offline. It never executes anything — it produces decisions and audit events. This is what you wire into CI.</li>
+<li><strong>MCP proxy mode</strong> (<code>agentfence proxy</code>) is a live gate. It spawns your MCP server as a subprocess, relays JSON-RPC over stdio in both directions, and intercepts every <code>tools/call</code>. Allowed calls are forwarded; denied calls get a JSON-RPC error response (<code>code -32001</code>, &quot;blocked by AgentFence policy&quot;) and the server never sees them; <code>ask</code> calls hit an approver. There&#39;s also <code>proxy-http</code> for remote MCP servers reached over streamable HTTP/SSE.</li>
+</ul>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/fence-d1.png" alt="Where AgentFence sits: between the agent and its tools, stamping every call and writing an audit trail you own.">
+<em>Where AgentFence sits: between the agent and its tools, stamping every call and writing an audit trail you own.</em></p>
+<p>Evaluation is deterministic. Rule lookup goes exact match → named group → wildcard → default, and the first match wins. Then any constraints on that rule run (paths, argument values, URLs, shell commands, durable-memory writes), with deny patterns evaluated before allow patterns so a denial short-circuits immediately. Because the default is <code>deny</code>, a call that matches nothing is blocked rather than waved through.</p>
+<p>One honest architectural point, stated plainly in the repo: <strong>AgentFence is not a sandbox.</strong> It enforces policy <em>before</em> a call executes; it does not contain a call that has already been forwarded. Pair it with OS-level isolation for defense in depth.</p>
+<h2>Try it in 5 minutes</h2>
+<p>You need Go 1.22+ (or grab a pre-built binary for Linux/macOS/Windows from the <a href="https://github.com/dgenio/agentfence/releases">Releases</a> page). Build from source:</p>
+<pre><code class="language-bash">go build -o agentfence ./cmd/agentfence
+</code></pre>
+<p>Run the built-in demo — it evaluates four bundled tool calls against the example policy:</p>
+<pre><code class="language-bash">./agentfence demo
+</code></pre>
+<p>You get a decision line plus a redacted JSONL audit event for each call. The interesting ones:</p>
+<pre><code class="language-text">call_002 filesystem.write -&gt; deny (path &quot;.env&quot; denied by pattern &quot;.env&quot;)
+{&quot;schema_version&quot;:&quot;2&quot;,&quot;seq&quot;:2,&quot;call_id&quot;:&quot;call_002&quot;,&quot;tool&quot;:&quot;filesystem.write&quot;,&quot;decision&quot;:&quot;deny&quot;,&quot;reason&quot;:&quot;path \&quot;.env\&quot; denied by pattern \&quot;.env\&quot;&quot;,&quot;arguments&quot;:{&quot;content&quot;:&quot;OPENAI_[REDACTED:generic_secret_assignment]&quot;,&quot;path&quot;:&quot;.env&quot;}}
+call_004 github.delete_repo -&gt; deny (tool github.delete_repo matched explicit policy rule)
+</code></pre>
+<p>Two things to notice. The <code>.env</code> write is denied by a path constraint, <em>and</em> the secret in its content was redacted to <code>[REDACTED:generic_secret_assignment]</code> before it ever touched the log. The <code>delete_repo</code> call is denied outright. (Timestamps and session IDs are real at runtime — UUIDs and RFC3339Nano values — shown abbreviated here.)</p>
+<p>Now run the same check yourself against the example files:</p>
+<pre><code class="language-bash">./agentfence check --policy examples/policy.yaml --call examples/tool-calls.jsonl
+</code></pre>
+<p>The input is just JSONL — one tool call per line, exactly the shape an agent emits:</p>
+<pre><code class="language-jsonl">{&quot;id&quot;:&quot;call_001&quot;,&quot;tool&quot;:&quot;filesystem.read&quot;,&quot;arguments&quot;:{&quot;path&quot;:&quot;README.md&quot;}}
+{&quot;id&quot;:&quot;call_002&quot;,&quot;tool&quot;:&quot;filesystem.write&quot;,&quot;arguments&quot;:{&quot;path&quot;:&quot;.env&quot;,&quot;content&quot;:&quot;OPENAI_API_KEY=sk-demo-secret&quot;}}
+{&quot;id&quot;:&quot;call_003&quot;,&quot;tool&quot;:&quot;github.create_issue&quot;,&quot;arguments&quot;:{&quot;repo&quot;:&quot;dgenio/agentfence&quot;,&quot;title&quot;:&quot;Demo issue&quot;,&quot;body&quot;:&quot;Created by an agent&quot;}}
+{&quot;id&quot;:&quot;call_004&quot;,&quot;tool&quot;:&quot;github.delete_repo&quot;,&quot;arguments&quot;:{&quot;repo&quot;:&quot;dgenio/agentfence&quot;}}
+</code></pre>
+<h3>The policy</h3>
+<p>Here&#39;s a minimal policy. Note the deny-by-default and the three decision types:</p>
+<pre><code class="language-yaml">version: &quot;0.1&quot;
+defaults:
+  decision: deny
+tools:
+  filesystem.read:
+    decision: allow
+  filesystem.write:
+    decision: ask
+  github.create_issue:
+    decision: ask
+  github.delete_repo:
+    decision: deny
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/fence-d2.png" alt="Rule lookup precedence: the first match wins, and unmatched calls fall through to a deny-by-default.">
+<em>Rule lookup precedence: the first match wins, and unmatched calls fall through to a deny-by-default.</em></p>
+<p>The real <a href="https://github.com/dgenio/agentfence"><code>examples/policy.yaml</code></a> goes further with constraints. A few examples straight from the repo:</p>
+<pre><code class="language-yaml">tools:
+  filesystem.write:
+    decision: ask
+    constraints:
+      paths:
+        allow: [&quot;./src/**&quot;, &quot;./docs/**&quot;]
+        deny: [&quot;.github/workflows/**&quot;, &quot;.env&quot;, &quot;**/secrets/**&quot;]
+
+  github.create_issue:
+    decision: ask
+    constraints:
+      args:
+        repo:
+          allow: [&quot;dgenio/*&quot;, &quot;myorg/*&quot;]
+          deny: [&quot;dgenio/private-*&quot;]
+
+  shell.exec:
+    decision: ask
+    constraints:
+      command:
+        allow_executables: [&quot;git&quot;, &quot;go&quot;, &quot;make&quot;, &quot;npm&quot;]
+        deny_patterns: [&quot;rm -rf*&quot;, &quot;curl * | bash&quot;]
+
+redaction:
+  enabled: true
+  patterns:
+    - name: openai_api_key
+      regex: &quot;sk-[A-Za-z0-9_-]{20,}&quot;
+    - name: github_token
+      regex: &quot;gh[pousr]_[A-Za-z0-9_]{20,}&quot;
+</code></pre>
+<h3>Validate, explain, test</h3>
+<p>Three commands make policies maintainable instead of magic. <code>validate</code> lints the file and rejects unknown fields:</p>
+<pre><code class="language-bash">./agentfence validate --policy examples/policy.yaml
+</code></pre>
+<p><code>explain</code> shows you <em>why</em> a single call got its decision, with a trace:</p>
+<pre><code class="language-bash">./agentfence explain --policy examples/policy.yaml \
+  --tool filesystem.write --args &#39;{&quot;path&quot;:&quot;.env&quot;}&#39;
+# decision: deny
+# reason:   path &quot;.env&quot; denied by pattern &quot;.env&quot;
+</code></pre>
+<p>And <code>policy test</code> runs declarative fixtures so your policy has a regression suite, the same way your code does.</p>
+<h3>Wire it into a live agent</h3>
+<p>For Claude Code or any MCP client, wrap the server command with <code>agentfence proxy</code> in your config:</p>
+<pre><code class="language-json">{
+  &quot;mcpServers&quot;: {
+    &quot;filesystem&quot;: {
+      &quot;command&quot;: &quot;agentfence&quot;,
+      &quot;args&quot;: [
+        &quot;proxy&quot;,
+        &quot;--policy&quot;, &quot;/Users/you/.config/agentfence/policy.yaml&quot;,
+        &quot;--audit-log&quot;, &quot;/Users/you/.local/share/agentfence/audit.jsonl&quot;,
+        &quot;--&quot;,
+        &quot;npx&quot;, &quot;-y&quot;, &quot;@modelcontextprotocol/server-filesystem&quot;, &quot;/Users/you/work&quot;
+      ]
+    }
+  }
+}
+</code></pre>
+<p>From the agent&#39;s side it still looks like one MCP server on stdio. AgentFence is invisible until a decision is enforced. On an <code>ask</code> rule with a terminal attached, you get a <code>y/N</code> prompt (read from <code>/dev/tty</code>, never stdin, so it can&#39;t collide with the JSON-RPC channel); in CI you pass <code>--no-interactive</code> to fail closed.</p>
+<h3>The audit trail you own</h3>
+<p>Write a tamper-evident log and verify it offline:</p>
+<pre><code class="language-bash">./agentfence check --policy examples/policy.yaml --call examples/tool-calls.jsonl \
+  --audit-log audit.jsonl --tamper-evident
+./agentfence audit verify --log audit.jsonl
+# OK: 4 event(s) verified
+</code></pre>
+<p>Each event is hash-chained to the previous one, so modifying or deleting an event in the middle is detectable — <code>verify</code> exits non-zero and names the event number that failed. v0.7.0 adds Ed25519 signing (<code>--sign-key</code>) to authenticate the writer, and publishable <em>anchors</em> so a third party can detect silent whole-log deletion. Useful one-liner once you have a log:</p>
+<pre><code class="language-bash">jq -c &#39;select(.decision==&quot;deny&quot;)&#39; audit.jsonl
+</code></pre>
+<h2>Honest limitations</h2>
+<p>The repo is refreshingly upfront, so I will be too:</p>
+<ul>
+<li><strong>It is not a sandbox.</strong> Enforcement happens before forwarding; it cannot claw back a call it already allowed. Use OS isolation alongside it.</li>
+<li><strong>Shell-command constraints are best-effort, not a security boundary.</strong> Metacharacters (<code>|</code>, <code>;</code>, <code>&amp;&amp;</code>, <code>$()</code>) can slip past <code>allow_executables</code> and <code>deny_patterns</code>. The docs say so in bold.</li>
+<li><strong>Tamper-evidence is detection, not prevention.</strong> Hash chaining lets you <em>detect</em> tampering after the fact; it doesn&#39;t stop someone with write access from rewriting the whole log. Whole-log deletion is only catchable if you also ship to an append-only <code>--audit-sink</code> or publish an anchor.</li>
+<li><strong>Taint tracking is a string-provenance heuristic</strong>, not full information-flow analysis, and only runs in the proxy paths where tool outputs are observed.</li>
+<li><strong>It&#39;s v0.7.0 — early.</strong> That said, &quot;early&quot; here means actively developed and tested: ~27 test files with 340+ test and fuzz functions, fuzz coverage on the parser/glob/redaction code, and a CI gate (<code>make ci</code>) that runs the policy fixtures.</li>
+</ul>
+<h2>Takeaways</h2>
+<ul>
+<li>AgentFence is a <strong>local, no-cloud policy gate</strong> for AI agent tool calls — allow, deny, or ask, with a human-readable reason on every decision.</li>
+<li>It runs as an <strong>offline batch checker</strong> for CI and a <strong>live MCP proxy</strong> for real agents, from one Go binary.</li>
+<li><strong>Deny-by-default</strong> plus path/arg/URL/shell/memory constraints means you opt calls in, not out.</li>
+<li><strong>Redaction</strong> scrubs secret-looking values before logging; <strong>tamper-evident, optionally signed, audit logs</strong> give you a trail you can verify offline.</li>
+<li>It&#39;s honest about being <strong>early-stage and not a sandbox</strong> — treat it as one layer of defense in depth, not the whole wall.</li>
+</ul>
+<p>AgentFence is part of the broader <strong>Weaver Stack</strong> of small, composable agent-safety tools: <strong>agent-kernel</strong> (an in-process firewall compiled into your agent), <strong>vibeguard</strong> (dev-time guardrails), and <strong>lessonweaver</strong> (which turns recurring deny/ask traces into reviewed policy lessons — AgentFence can export its audit decisions straight into it). Each works standalone; AgentFence has no hard dependency on any of them.</p>
+<h2>Try it and star it</h2>
+<p>If you run agents that touch anything you&#39;d be unhappy to lose, spend five minutes with the demo and write one policy for the surface you care about most. It&#39;s Apache-2.0, runs entirely on your machine, and the deny-by-default policy means you can&#39;t make things worse by trying it.</p>
+<p><strong>Star the repo, file an issue, or open a PR: <a href="https://github.com/dgenio/agentfence">github.com/dgenio/agentfence</a>.</strong> Early projects live or die by early feedback — if you kick the tires, tell the maintainer what broke.</p>
+
+</article></body></html>

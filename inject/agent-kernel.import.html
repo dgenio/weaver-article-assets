@@ -1,0 +1,183 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Capability Tokens for AI Agents: A Security Kernel in Python</title><meta name="author" content="Diogo Santos"></head><body><article><h1>Capability Tokens for AI Agents: A Security Kernel in Python</h1>
+<p><em>Your agent has 1,000 tools and no idea which ones it&#39;s allowed to call. agent-kernel gives every tool call an HMAC capability token, a policy gate, and a tamper-evident audit trail — in-process, in two dependencies.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-agent-kernel.png" alt="Capability Tokens for AI Agents: A Security Kernel in Python">
+Your agent works. You wired up an LLM, handed it a pile of MCP tools, and watched it plan, call <code>list_invoices</code>, summarize the result. Demo-day magic.</p>
+<p>Then you tried to ship it, and the questions started:</p>
+<ul>
+<li>The agent has a tool that deletes records. What stops it from calling that tool when a prompt-injected document <em>tells it to</em>?</li>
+<li>A <code>list_customers</code> tool returns <code>email</code> and <code>phone</code>. Those rows go straight into the model&#39;s context. Who decided that was OK?</li>
+<li>Three weeks from now, someone asks &quot;did the agent touch the billing system on the 4th, and under whose authority?&quot; Can you answer?</li>
+</ul>
+<p>Most agent frameworks have no answer, because they were built to make tool-calling <em>work</em>, not to make it <em>safe to operate</em>. The tool registry is a flat list. Any tool the model can name, it can call. Raw tool output flows directly back into the prompt. And the only record of what happened is whatever you happened to log.</p>
+<p>This is the gap <a href="https://github.com/dgenio/agent-kernel"><code>agent-kernel</code></a> is built to close. It&#39;s a small Python library (on PyPI as <strong><code>weaver-kernel</code></strong>) that sits <em>between</em> your LLM loop and your tools and enforces a simple rule: <strong>no token, no execution</strong> — and it keeps a tamper-evident record of every call that ran.</p>
+<p>It is honest <strong>alpha</strong> software (<code>Development Status :: 3 - Alpha</code>, currently <code>0.11.0</code>), but it&#39;s not a sketch: 665 tests, two runtime dependencies, strict <code>mypy</code>. This post is a deep-dive into the actual mechanism — the token, the policy gate, the firewall, and the audit chain — with code you can run today.</p>
+<h2>The idea in one paragraph</h2>
+<p><code>agent-kernel</code> borrows <strong>capability-based security</strong> from operating-system design and applies it to tool calls. Instead of asking &quot;is this agent allowed to do things?&quot; at login and trusting it forever, every single tool invocation must present a <strong>capability token</strong>: an HMAC-signed, time-bounded credential scoped to exactly one principal and one capability. The kernel runs a <strong>policy engine</strong> to decide whether to mint that token, routes the call to a <strong>driver</strong> (MCP, HTTP, or in-memory), passes the result through a <strong>context firewall</strong> that redacts and bounds it before the LLM ever sees it, and writes an <strong><code>ActionTrace</code></strong> to a hash-chained audit log. Five steps, one in-process call path, no external proxy required.</p>
+<h2>How it works</h2>
+<p>The full lifecycle is <strong>register → grant → invoke → expand → explain</strong>. Here&#39;s the shape of it before we dig into each piece.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/kernel-d1.png" alt="The request path: every tool call is authorized, signed, executed, firewalled, and audited.">
+<em>The request path: every tool call is authorized, signed, executed, firewalled, and audited.</em></p>
+<h3>1. Capabilities, not functions</h3>
+<p>A <em>capability</em> is a registered, auditable action — not a raw Python function. Registering one carries the metadata the kernel needs to reason about safety:</p>
+<pre><code class="language-python">from weaver_kernel import (
+    Capability, CapabilityRegistry, ImplementationRef,
+    SafetyClass, SensitivityTag,
+)
+
+registry = CapabilityRegistry()
+registry.register(
+    Capability(
+        capability_id=&quot;billing.invoices.list&quot;,
+        name=&quot;List Invoices&quot;,
+        description=&quot;List recent invoices&quot;,
+        safety_class=SafetyClass.READ,
+        sensitivity=SensitivityTag.PII,
+        allowed_fields=[&quot;id&quot;, &quot;customer_name&quot;, &quot;amount&quot;, &quot;status&quot;],
+        tags=[&quot;billing&quot;, &quot;invoices&quot;, &quot;list&quot;],
+        impl=ImplementationRef(driver_id=&quot;memory&quot;, operation=&quot;list_invoices&quot;),
+    )
+)
+</code></pre>
+<p>Two fields do the heavy lifting. <code>safety_class</code> is one of <code>READ</code>, <code>WRITE</code>, or <code>DESTRUCTIVE</code> — it controls which roles may call the capability at all. <code>sensitivity</code> (<code>PII</code>, <code>PCI</code>, <code>SECRETS</code>, <code>MEMORY</code>) tells the policy engine and the firewall how to treat the data. The <code>allowed_fields</code> projection is the whitelist the firewall enforces: <code>email</code> isn&#39;t on that list, so <code>email</code> never reaches the model — even though the underlying driver returns it.</p>
+<h3>2. The capability token: where confused-deputy attacks go to die</h3>
+<p>The token is the heart of the system. Here is the actual signing payload from <code>tokens.py</code>:</p>
+<pre><code class="language-python">def _signable_payload(self) -&gt; str:
+    payload = {
+        &quot;token_id&quot;: self.token_id,
+        &quot;capability_id&quot;: self.capability_id,
+        &quot;principal_id&quot;: self.principal_id,
+        &quot;issued_at&quot;: self.issued_at.isoformat(),
+        &quot;expires_at&quot;: self.expires_at.isoformat(),
+        &quot;constraints&quot;: self.constraints,
+        &quot;audit_id&quot;: self.audit_id,
+    }
+    return json.dumps(payload, sort_keys=True, separators=(&quot;,&quot;, &quot;:&quot;))
+</code></pre>
+<p>That JSON is signed with HMAC-SHA256 using a secret from <code>WEAVER_KERNEL_SECRET</code>. Verification then runs, in order: revocation check, expiry check, <strong>constant-time</strong> signature comparison (<code>hmac.compare_digest</code>), then two binding checks:</p>
+<pre><code class="language-python"># 3. Principal binding (confused-deputy prevention)
+if token.principal_id != expected_principal_id:
+    raise TokenScopeError(...)
+
+# 4. Capability binding
+if token.capability_id != expected_capability_id:
+    raise TokenScopeError(...)
+</code></pre>
+<p>This is what closes the classic <strong>confused-deputy</strong> hole. If agent A obtains a token for <code>billing.list_invoices</code> and hands it to agent B, B&#39;s invocation arrives with <code>expected_principal_id=&quot;B&quot;</code>, the binding check fails, and the call is rejected. A token is not a bearer credential — it&#39;s bound to <em>who</em> asked and <em>what</em> they asked for. Tamper with any field and the recomputed HMAC won&#39;t match: <code>TokenInvalid</code>.</p>
+<h3>3. The policy engine decides whether a token is even minted</h3>
+<p><code>get_token()</code> doesn&#39;t just sign — it first runs <code>DefaultPolicyEngine.evaluate()</code>, a deterministic, ordered rule chain. The real defaults, straight from <code>policy.py</code>:</p>
+<ul>
+<li><strong>WRITE</strong> capabilities require the <code>writer</code> or <code>admin</code> role <em>and</em> a justification of at least 15 characters.</li>
+<li><strong>DESTRUCTIVE</strong> requires <code>admin</code>.</li>
+<li><strong>PII/PCI</strong> capabilities require a <code>tenant</code> attribute on the principal, and apply <code>allowed_fields</code> unless the principal has the <code>pii_reader</code> role.</li>
+<li><strong>SECRETS</strong> require <code>admin</code> or <code>secrets_reader</code> plus a justification.</li>
+<li><strong>Row caps</strong>: 50 rows for regular users, 500 for principals with the <code>service</code> role.</li>
+<li><strong>Rate limits</strong> (sliding window, per <code>principal_id:capability_id</code>): 60 READ / 10 WRITE / 2 DESTRUCTIVE per 60-second window; <code>service</code> principals get 10×.</li>
+</ul>
+<p>Every decision carries a stable, machine-branchable <code>reason_code</code> (<code>missing_role</code>, <code>missing_tenant_attribute</code>, <code>rate_limited</code>, …) — the docs are explicit that your tests should assert on the code, not the human-readable string. A denied write looks like this:</p>
+<pre><code class="language-python">from weaver_kernel.errors import PolicyDenied
+
+try:
+    kernel.get_token(
+        CapabilityRequest(capability_id=&quot;billing.invoices.create&quot;,
+                          goal=&quot;create an invoice&quot;),
+        alice, justification=&quot;reader trying a write — should fail&quot;,
+    )
+except PolicyDenied as exc:
+    print(exc.reason_code)   # &#39;missing_role&#39;
+</code></pre>
+<h3>4. The context firewall: raw output never reaches the model</h3>
+<p>This is the invariant the project guards hardest (weaver-spec <strong>I-01</strong>): the LLM never sees raw driver output by default. The <code>Firewall</code> always transforms a <code>RawResult</code> into a bounded <code>Frame</code>. A <code>Frame</code> carries compact <code>facts</code>, an optional row preview, and a <code>Handle</code> the model can expand <em>later</em> — within budget. Redaction is regex-based and covers emails, phone numbers, card and SSN patterns, <code>Bearer</code> tokens, JWTs, API keys, and connection strings, and it <strong>fails closed at the depth limit</strong>: nested containers past <code>max_depth</code> are elided as <code>[REDACTED: nested data beyond depth limit]</code> rather than passed through raw (a real bug fixed in 0.11.0, #149).</p>
+<p>There&#39;s a <code>raw</code> response mode, but non-admin principals can&#39;t get it — the firewall silently downgrades them to <code>summary</code>.</p>
+<h3>5. Tamper-evident audit</h3>
+<p>Every successful <code>invoke()</code> writes an <code>ActionTrace</code> you can retrieve with <code>kernel.explain(action_id)</code>: who, what, when, which driver, under which policy decision. With a durable backend (<code>SQLiteTraceStore</code> or append-only <code>JsonlTraceStore</code>), each record is wrapped in a hash chain:</p>
+<pre><code>record_hash = HMAC-SHA256(secret, {seq, prev_hash, trace})
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/kernel-d2.png" alt="The audit hash chain: each record commits to the previous one, so mutation, insertion, deletion, and reordering are all detectable.">
+<em>The audit hash chain: each record commits to the previous one, so mutation, insertion, deletion, and reordering are all detectable.</em></p>
+<p><code>verify_chain()</code> recomputes every link and reports the <code>seq</code> of the first divergent record, catching mutation, interior insertion, deletion, and reordering. The maintainers are refreshingly precise about the limit: because there&#39;s no signed head anchor, <strong>tail-truncation and whole-log deletion are not detected</strong> — that&#39;s a documented follow-up, and until then the recommended defense is append-only durable storage. This is <em>tamper-evidence</em>, not non-repudiation. It&#39;s rare to see a security library this candid about its own threat model.</p>
+<h2>Try it in 5 minutes</h2>
+<p>Two dependencies, no services to stand up.</p>
+<pre><code class="language-bash">pip install weaver-kernel
+</code></pre>
+<blockquote>
+<p>Note the naming: the GitHub repo is <code>dgenio/agent-kernel</code>, the PyPI package is <strong><code>weaver-kernel</code></strong>, and the Python import is <strong><code>weaver_kernel</code></strong>. There is no <code>agent_kernel</code> import anymore.</p>
+</blockquote>
+<p>The following is the project&#39;s own README quickstart — it&#39;s extracted and executed by CI (<code>tests/test_readme_quickstart.py</code>), so it can&#39;t silently drift from the working API. I ran it against <code>0.11.0</code> while writing this; the output below is real.</p>
+<pre><code class="language-python">import asyncio, os
+os.environ[&quot;WEAVER_KERNEL_SECRET&quot;] = &quot;my-secret&quot;
+
+from weaver_kernel import (
+    Capability, CapabilityRegistry,
+    InMemoryDriver, Kernel, Principal, SafetyClass, StaticRouter,
+)
+from weaver_kernel.models import CapabilityRequest
+
+# 1. Register a capability
+registry = CapabilityRegistry()
+registry.register(Capability(
+    capability_id=&quot;tasks.list&quot;,
+    name=&quot;List Tasks&quot;,
+    description=&quot;List all tasks&quot;,
+    safety_class=SafetyClass.READ,
+    tags=[&quot;tasks&quot;, &quot;list&quot;],
+))
+
+# 2. Wire up a driver
+driver = InMemoryDriver()
+driver.register_handler(&quot;tasks.list&quot;, lambda ctx: [{&quot;id&quot;: 1, &quot;title&quot;: &quot;Buy milk&quot;}])
+
+# 3. Build the kernel
+kernel = Kernel(registry=registry, router=StaticRouter(routes={&quot;tasks.list&quot;: [&quot;memory&quot;]}))
+kernel.register_driver(driver)
+
+async def main():
+    principal = Principal(principal_id=&quot;alice&quot;, roles=[&quot;reader&quot;])
+
+    # 4. grant -&gt; invoke -&gt; expand -&gt; explain
+    token = kernel.get_token(
+        CapabilityRequest(capability_id=&quot;tasks.list&quot;, goal=&quot;list tasks&quot;),
+        principal, justification=&quot;&quot;,
+    )
+    frame = await kernel.invoke(token, principal=principal, args={})
+    print(frame.facts)   # [&#39;Total rows: 1&#39;, &#39;Top keys: id, title&#39;, &#39;id: min=1.00, max=1.00, avg=1.00&#39;]
+
+    # principal is required: the handle is bound to the granting principal
+    expanded = kernel.expand(
+        frame.handle, query={&quot;limit&quot;: 1, &quot;fields&quot;: [&quot;title&quot;]}, principal=principal
+    )
+    print(expanded.table_preview)   # [{&#39;title&#39;: &#39;Buy milk&#39;}]
+
+    trace = kernel.explain(frame.action_id)
+    print(trace.driver_id)          # &#39;memory&#39;
+
+asyncio.run(main())
+</code></pre>
+<p>Notice that <code>expand()</code> <em>requires</em> the <code>principal</code> — a handle bound to one principal can&#39;t be expanded by another, the same confused-deputy guard applied to data references. When you&#39;re ready for a real tool server, swap <code>InMemoryDriver</code> for <code>MCPDriver.from_stdio(...)</code>; capabilities, policy, tokens, and firewall behave identically. There&#39;s also a <code>weaver-kernel</code> operator CLI (<code>audit list|show|verify|export</code>, plus <code>doctor</code>) for inspecting and verifying a persisted trace store, and zero-dependency adapters that emit Anthropic and OpenAI tool definitions and route <code>tool_use</code> blocks through the kernel.</p>
+<h2>Honest limitations</h2>
+<p>The README says it plainly: <strong>v0.1 is not production-hardened for real authentication.</strong> Specifically:</p>
+<ul>
+<li><strong>HMAC tokens are signed, not encrypted.</strong> Don&#39;t put secrets in token fields. The <code>WEAVER_KERNEL_SECRET</code> must be kept secret and rotated if compromised — and because that same secret signs both tokens and the audit chain, the log is only as trustworthy as your secret custody.</li>
+<li><strong>PII redaction is heuristic</strong> (regex). It catches common patterns; it is not a substitute for real data governance. Streaming redaction reassembles secrets split across chunks via a bounded holdback window, but a pattern with internal whitespace split exactly at the boundary, or a single token longer than the buffer, can still slip — a documented memory-vs-safety trade.</li>
+<li><strong>Audit truncation isn&#39;t detectable yet</strong> (no signed head anchor), and rate-limit state is in-process only — it resets on restart and isn&#39;t distributed.</li>
+<li>It&#39;s <strong>alpha</strong>, single-digit minor version. The import name changed under it recently (<code>agent_kernel</code> → <code>weaver_kernel</code> in 0.10.0). Expect churn.</li>
+</ul>
+<p>None of this is disqualifying for the job it&#39;s built for — adding least-privilege authorization and an audit trail to an agent you control — but go in with eyes open.</p>
+<h2>Where it fits</h2>
+<p><code>agent-kernel</code> is the in-process <strong>authorization runtime</strong> of the broader <strong>Weaver stack</strong>, and it&#39;s deliberately scoped against its siblings:</p>
+<ul>
+<li><a href="https://github.com/dgenio/contextweaver"><code>contextweaver</code></a> decides <em>what context the LLM sees</em>; <code>agent-kernel</code> produces the canonical <code>Frame</code> it selects over.</li>
+<li><a href="https://github.com/dgenio/AgentFence"><code>AgentFence</code></a> enforces a policy gate at the <em>external process boundary</em>; <code>agent-kernel</code> enforces the equivalent gate <em>embedded</em> in your agent host.</li>
+<li><code>ChainWeaver</code> runs deterministic tool chains; <a href="https://github.com/dgenio/weaver-spec"><code>weaver-spec</code></a> is the shared contract all of them conform to.</li>
+</ul>
+<p>It has <strong>no hard dependency</strong> on any of them — <code>httpx</code> and <code>pydantic</code> are the whole runtime footprint. Use it standalone today.</p>
+<h2>Takeaways</h2>
+<ul>
+<li><strong>Treat tool calls like syscalls.</strong> A capability token scoped to one principal + one capability + a TTL turns &quot;the agent can call anything it can name&quot; into &quot;the agent can do exactly what it was granted, and not a byte more.&quot;</li>
+<li><strong>The firewall is the under-rated half.</strong> Bounding and redacting tool output before it hits the context window defends against both context blowup <em>and</em> prompt injection riding in on raw data.</li>
+<li><strong>Audit is a feature, not an afterthought.</strong> A hash-chained <code>ActionTrace</code> per invocation means &quot;what did the agent do, and under whose authority?&quot; has an answer you can verify.</li>
+<li><strong>Know the boundaries.</strong> Tamper-evidence ≠ non-repudiation; heuristic redaction ≠ governance; alpha ≠ production-hardened. The repo says so itself, which is the right instinct in a security project.</li>
+</ul>
+<p>If you&#39;re building agents that touch anything that matters — money, customer data, destructive operations — the authorization-and-audit layer is not optional, and you probably shouldn&#39;t hand-roll it. <code>agent-kernel</code> is a small, well-tested, brutally honest starting point.</p>
+<p><strong>Star and try the repo: <a href="https://github.com/dgenio/agent-kernel">github.com/dgenio/agent-kernel</a>.</strong> <code>pip install weaver-kernel</code>, run the quickstart, and file an issue when you hit a sharp edge — alpha projects improve fastest when real users push on them.</p>
+
+</article></body></html>

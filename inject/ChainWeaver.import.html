@@ -1,0 +1,197 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>ChainWeaver: Compile Deterministic Agent Tool Flows, No LLM Between Steps</title><meta name="author" content="Diogo Santos"></head><body><article><h1>ChainWeaver: Compile Deterministic Agent Tool Flows, No LLM Between Steps</h1>
+<p><em>Your agent keeps re-deciding the same tool path on every turn. Compile it once into a typed, LLM-free flow — and watch the data-corruption rate drop from 61–96% to 0%.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-ChainWeaver.png" alt="ChainWeaver: Compile Deterministic Agent Tool Flows, No LLM Between Steps">
+Your agent works. It also does something quietly wasteful on every single turn.</p>
+<p>Watch a typical tool-using loop handle a request. It runs <code>search</code>, then asks the model &quot;what now?&quot;, runs <code>extract</code>, asks the model again, runs <code>validate</code>, asks again, runs <code>format</code>. Four tool calls, and <em>four</em> model round-trips wedged between them — even though the path never changes. Given a search result, you always extract. Given facts, you always validate. The model isn&#39;t reasoning at those points. It&#39;s re-deriving a decision you already know the answer to, at the price of latency, tokens, and one more chance to hallucinate a field.</p>
+<p><a href="https://github.com/dgenio/ChainWeaver">ChainWeaver</a> is a small Python library that takes those repeated, deterministic tool paths and <strong>compiles them into typed flows that execute with no LLM between steps.</strong> This is a practical walk-through: the problem, the mechanism, a flow you can run in five minutes, the benchmark numbers (with their caveats), and an honest read on maturity. It&#39;s alpha software — version 0.13.0 — and I&#39;ll be specific about what that means.</p>
+<h2>The problem, concretely</h2>
+<p>An LLM-mediated tool loop inserts a model call between every step so the model can &quot;decide&quot; what to do next:</p>
+<pre><code>User request
+    │
+    ▼
+LLM call ──► Tool A
+    │
+    ▼
+LLM call ──► Tool B
+    │
+    ▼
+LLM call ──► Tool C
+    │
+    ▼
+Response
+</code></pre>
+<p>For a path that is genuinely <strong>deterministic</strong> — where the next tool is fully determined by the previous output — those intermediate calls buy you nothing and cost you three things:</p>
+<ul>
+<li><strong>Latency.</strong> Each round-trip is hundreds of milliseconds of model time.</li>
+<li><strong>Cost.</strong> Every call burns input tokens (the growing transcript), output tokens, and re-sends the tool schemas.</li>
+<li><strong>Unpredictability.</strong> A model re-asked &quot;what next?&quot; can route differently, and — worse — it can quietly mangle the data it passes between tools. Drop a field. Rename <code>user_id</code> to <code>userId</code>. Turn <code>&quot;42&quot;</code> into <code>42</code> or <code>42</code> into <code>&quot;forty-two&quot;</code>. The envelope still looks plausible, so nothing errors. The data is just wrong.</li>
+</ul>
+<p>That last point is the expensive one, and it compounds. If each hand-off has even a ~25% chance of structural corruption, a four-step chain is corrupted more often than not, and a ten-step chain is corrupted almost every time. ChainWeaver&#39;s own benchmark puts numbers on this; we&#39;ll get there.</p>
+<h2>The idea in one paragraph</h2>
+<p>ChainWeaver is the difference between an <strong>interpreter</strong> and a <strong>compiler</strong> for tool chains. You keep the model where it adds value — picking <em>which</em> flow to run — and you compile the deterministic interior into a named, versioned <code>Flow</code> object. A <code>FlowExecutor</code> runs that flow step by step with strict <a href="https://docs.pydantic.dev/">Pydantic</a> validation at every boundary and <strong>zero model calls in between</strong>. The agent still decides to invoke <code>search_summarize_flow</code>; the four tool calls inside it no longer round-trip through the model. That single design choice — <em>LLM-free between steps, enforced at the framework level</em> — is the whole point, and the rest of the library (typed I/O, file-serializable flows, schema-drift detection, structured traces) is built around defending it.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/chain-d1.png" alt="Naive LLM-in-the-loop chaining vs. a compiled ChainWeaver flow. Every diamond is a model round-trip that can hallucinate, drop, or retype a field; the compiled path replaces them with Pydantic-validated dict merges.">
+<em>Naive LLM-in-the-loop chaining vs. a compiled ChainWeaver flow. Every diamond is a model round-trip that can hallucinate, drop, or retype a field; the compiled path replaces them with Pydantic-validated dict merges.</em></p>
+<h2>How it works</h2>
+<p>Three primitives carry the whole model.</p>
+<p>A <strong><code>Tool</code></strong> wraps a plain Python callable together with a Pydantic input schema and output schema:</p>
+<pre><code class="language-python">from pydantic import BaseModel
+from chainweaver import Tool
+
+class NumberInput(BaseModel):
+    number: int
+
+class ValueOutput(BaseModel):
+    value: int
+
+def double_fn(inp: NumberInput) -&gt; dict:
+    return {&quot;value&quot;: inp.number * 2}
+
+double = Tool(
+    name=&quot;double&quot;,
+    description=&quot;Takes a number and returns its double.&quot;,
+    input_schema=NumberInput,
+    output_schema=ValueOutput,
+    fn=double_fn,
+)
+</code></pre>
+<p>A <strong><code>Flow</code></strong> is an ordered list of <code>FlowStep</code>s. Each step names a tool and an <code>input_mapping</code> — how to pull this tool&#39;s inputs out of the accumulated execution context:</p>
+<pre><code class="language-python">from chainweaver import Flow, FlowStep
+
+flow = Flow(
+    name=&quot;double_add_format&quot;,
+    description=&quot;Doubles a number, adds 10, and formats the result.&quot;,
+    steps=[
+        FlowStep(tool_name=&quot;double&quot;,        input_mapping={&quot;number&quot;: &quot;number&quot;}),
+        FlowStep(tool_name=&quot;add_ten&quot;,       input_mapping={&quot;value&quot;: &quot;value&quot;}),
+        FlowStep(tool_name=&quot;format_result&quot;, input_mapping={&quot;value&quot;: &quot;value&quot;}),
+    ],
+)
+</code></pre>
+<p>In <code>input_mapping</code>, a string value is a context lookup (a plain key is a top-level lookup; a string starting with <code>/</code> is an RFC-6901 JSON pointer into nested context, e.g. <code>&quot;/user/address/city&quot;</code>), and a non-string value is a literal constant. An optional <code>output_mapping</code> renames and prunes a tool&#39;s outputs before they merge.</p>
+<p>A <strong><code>FlowExecutor</code></strong> runs it. The per-step execution path is the entire data-integrity story:</p>
+<pre><code>validate(input)  →  fn(input)  →  validate(output)  →  context.update(output)
+</code></pre>
+<p>No code path <em>between</em> the two <code>validate</code> calls can add, drop, or rename a field. The intermediate context is a plain Python <code>dict</code> updated by direct assignment — no serialization round-trip, no schema inference, no model in the loop. That property is protected by a hard invariant the project enforces by review: <strong>no LLM calls, no network I/O, and no randomness inside <code>executor.py</code>.</strong> (It&#39;s literally rule #1 in the repo&#39;s <code>CLAUDE.md</code>.)</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/chain-d2.png" alt="Inside FlowExecutor: each step runs validate(input) -&gt; fn -&gt; validate(output) -&gt; merge into a plain dict context. No code path between the two validations can add, drop, or rename a field.">
+<em>Inside FlowExecutor: each step runs validate(input) -&gt; fn -&gt; validate(output) -&gt; merge into a plain dict context. No code path between the two validations can add, drop, or rename a field.</em></p>
+<p>There&#39;s also a discovery side most &quot;just wire it up&quot; libraries lack. <code>ChainAnalyzer</code> inspects a set of tools <em>offline</em> and computes which ones are schema-compatible — every required input field of a consumer must appear, with a matching type, in some producer&#39;s output. <code>analyzer.suggest_flows(max_depth=3)</code> then returns ready-to-register <code>Flow</code> objects with <code>input_mapping</code> auto-wired by name. And <code>ChainObserver</code> watches what your agent actually does at runtime and proposes compiled flows for the paths it repeats — ranked, never auto-registered. The intended loop is <em>observe → compile → replace</em>: you don&#39;t hand-wire the flow, you compile the path the analyzer or observer surfaces.</p>
+<h2>Try it in five minutes</h2>
+<p>Install from PyPI. The <code>[yaml]</code> extra is the common one — you need it for <code>.flow.yaml</code> files and the CLI:</p>
+<pre><code class="language-bash">pip install &#39;chainweaver[yaml]&#39;
+</code></pre>
+<p>The base install pulls only five runtime dependencies (<code>deepdiff</code>, <code>packaging</code>, <code>pydantic</code>, <code>tenacity</code>, <code>typer</code>) and pins <strong>no</strong> LLM SDK. Here is a complete, runnable three-step flow — adapted directly from <code>examples/simple_linear_flow.py</code> in the repo:</p>
+<pre><code class="language-python">from pydantic import BaseModel
+from chainweaver import Tool, Flow, FlowStep, FlowRegistry, FlowExecutor
+
+# --- 1. Schemas ---
+class NumberInput(BaseModel):
+    number: int
+
+class ValueOutput(BaseModel):
+    value: int
+
+class ValueInput(BaseModel):
+    value: int
+
+class FormattedOutput(BaseModel):
+    result: str
+
+# --- 2. Tool functions ---
+def double_fn(inp: NumberInput) -&gt; dict:
+    return {&quot;value&quot;: inp.number * 2}
+
+def add_ten_fn(inp: ValueInput) -&gt; dict:
+    return {&quot;value&quot;: inp.value + 10}
+
+def format_result_fn(inp: ValueInput) -&gt; dict:
+    return {&quot;result&quot;: f&quot;Final value: {inp.value}&quot;}
+
+# --- 3. Tools ---
+double = Tool(name=&quot;double&quot;, description=&quot;Doubles a number.&quot;,
+              input_schema=NumberInput, output_schema=ValueOutput, fn=double_fn)
+add_ten = Tool(name=&quot;add_ten&quot;, description=&quot;Adds ten.&quot;,
+               input_schema=ValueInput, output_schema=ValueOutput, fn=add_ten_fn)
+format_result = Tool(name=&quot;format_result&quot;, description=&quot;Formats the value.&quot;,
+                     input_schema=ValueInput, output_schema=FormattedOutput, fn=format_result_fn)
+
+# --- 4. Flow ---
+flow = Flow(
+    name=&quot;double_add_format&quot;,
+    description=&quot;Doubles a number, adds 10, and formats the result.&quot;,
+    steps=[
+        FlowStep(tool_name=&quot;double&quot;,        input_mapping={&quot;number&quot;: &quot;number&quot;}),
+        FlowStep(tool_name=&quot;add_ten&quot;,       input_mapping={&quot;value&quot;: &quot;value&quot;}),
+        FlowStep(tool_name=&quot;format_result&quot;, input_mapping={&quot;value&quot;: &quot;value&quot;}),
+    ],
+)
+
+# --- 5. Register and execute — zero LLM calls ---
+registry = FlowRegistry()
+registry.register_flow(flow)
+
+executor = FlowExecutor(registry=registry)
+executor.register_tool(double)
+executor.register_tool(add_ten)
+executor.register_tool(format_result)
+
+result = executor.execute_flow(&quot;double_add_format&quot;, {&quot;number&quot;: 5})
+
+print(result.success)       # True
+print(result.final_output)  # {&#39;number&#39;: 5, &#39;value&#39;: 20, &#39;result&#39;: &#39;Final value: 20&#39;}
+
+for record in result.execution_log:
+    print(record.step_index, record.tool_name, record.outputs)
+# 0 double {&#39;value&#39;: 10}
+# 1 add_ten {&#39;value&#39;: 20}
+# 2 format_result {&#39;result&#39;: &#39;Final value: 20&#39;}
+</code></pre>
+<p>The structured <code>execution_log</code> — step index, tool name, validated outputs — is what makes a run auditable: you can diff it, store it, or replay it.</p>
+<p>Prefer less boilerplate? The <code>@tool</code> decorator introspects type hints to build the input schema for you:</p>
+<pre><code class="language-python">from chainweaver import tool
+
+@tool(description=&quot;Doubles a number.&quot;)
+def double(number: int) -&gt; ValueOutput:
+    return {&quot;value&quot;: number * 2}
+
+print(double(number=5))  # {&#39;value&#39;: 10} — decorated tools stay directly callable
+</code></pre>
+<p>And if you&#39;d rather not touch Python at all, the bundled CLI runs a flow file straight from disk:</p>
+<pre><code class="language-bash">chainweaver run examples/double_add_format.flow.yaml \
+    --tools examples.simple_linear_flow \
+    --input &#39;{&quot;number&quot;: 5}&#39;
+</code></pre>
+<p>The CLI also ships <code>validate</code>, <code>check</code>, <code>viz</code> (ASCII / Graphviz DOT / Mermaid), <code>explain</code>, <code>attest</code> (observed-determinism evidence over N inputs × M repeats), <code>record</code> (mine candidate flows from a recorded JSONL trace), and <code>doctor</code>. All subcommands share an exit-code contract (<code>0</code> success, <code>1</code> business error, <code>2</code> file/argument error) and most accept <code>--format json</code> wrapped in a versioned envelope for automation.</p>
+<h2>The benchmark: latency, and the part that actually matters</h2>
+<p>ChainWeaver ships a reproducible benchmark you regenerate with <code>python benchmarks/report.py</code>. The latest committed benchmark report (generated under ChainWeaver 0.11.0, Python 3.11, priced 2026-05-01; the execution path is unchanged through 0.13.0) reports two things.</p>
+<p><strong>Latency</strong> — compiled vs. naive, where each naive step pays a simulated model delay:</p>
+<pre><code class="language-text">Steps   LLM delay (ms)   Naive total (ms)   Compiled total (ms)   Speedup
+-----   --------------   ----------------   -------------------   -------
+2       100              100.34             0.25                  407×
+5       200              801.12             0.35                  2306×
+10      200              1904.36            102.95                18.5×
+</code></pre>
+<p>Those speedups are eye-catching but they are a <em>proxy</em>: the naive baseline simulates a model round-trip with <code>time.sleep</code>, so the figures isolate <strong>round-trip count</strong>, not any real provider&#39;s wall-clock. Read them as &quot;this many model calls were removed,&quot; not &quot;your p99 will drop 2000×.&quot;</p>
+<p><strong>Correctness</strong> is the number I&#39;d actually publish. The benchmark routes the same chain two ways. The naive path runs through a seeded, configurable corruption model whose per-step rates — field hallucination, data loss, type corruption, schema drift, routing variance — are order-of-magnitude estimates loosely informed by published tool-calling reliability studies. The compiled path runs the identical chain through <code>FlowExecutor</code>:</p>
+<pre><code class="language-text">Scenario           Steps   Naive corruption   Compiled corruption
+----------------   -----   ----------------   -------------------
+numeric_pipeline   4       61.0%              **0.0%**
+data_enrichment    4       61.0%              **0.0%**
+long_chain         10      96.0%              **0.0%**
+</code></pre>
+<p>The compiled <code>0.0%</code> is not a measurement that happened to come out clean — it&#39;s structural. There is no code path in the validated-merge pipeline that <em>can</em> hallucinate, drop, or rename a field, so corruption events go to zero by construction. The naive rates, meanwhile, behave exactly as compounding predicts: plug the default per-step rates into <code>1 − (∏ clean_rate)^n</code> and a 4-step chain lands near 69% and a 10-step chain near 95% — right where the seeded model reports 61% and 96%.</p>
+<p>On cost, the same report estimates a 10-step flow avoids <strong>$0.0607</strong> of LLM spend (priced against <code>anthropic/claude-sonnet-4-6</code>). That&#39;s small per run and scales with your assumed tokens-per-call — and the repo is careful to call it an <em>estimate from a dated price snapshot</em>, not billed usage. The <code>compute_cost_report(...)</code> helper will produce one for your own step counts and model, and it raises rather than guessing for a <code>(provider, model)</code> pair it doesn&#39;t have a price for. <strong>Cost savings are framed as a consequence here, not the headline — and that&#39;s the honest framing.</strong></p>
+<h2>Honest limitations</h2>
+<p>This is alpha software (<code>Development Status :: 3 - Alpha</code>, version 0.13.0). The test suite is substantial for the stage — roughly 1,600 test functions across ~108 test files, with an 80% coverage floor enforced in CI — but the API can still move before 1.0.</p>
+<p>More importantly, ChainWeaver guarantees the <strong>envelope, not the contents.</strong> A tool whose <code>fn</code> returns <code>{&quot;price_usd&quot;: 999999.99}</code> for every request still satisfies a <code>price_usd: float</code> schema — the executor validates the shape, not the truthfulness. Determinism is a property of the <em>flow</em>: if one of your tools calls a clock, an RNG, or a flaky network service, that tool breaks the guarantee, and ChainWeaver doesn&#39;t pretend otherwise (use <code>chainweaver attest</code> to gather observed-determinism evidence). And by design it is <strong>not</strong> an agent framework or a general workflow engine — if every step needs open-ended reasoning to pick the next one, use LangGraph or an SDK tool-use loop; if you need durable, scheduled, long-running jobs, use Prefect, Dagster, or Temporal. ChainWeaver is meant to be called <em>from</em> an agent framework, not to replace one. It&#39;s the deterministic-execution layer of the broader <a href="https://github.com/dgenio/weaver-spec">Weaver Stack</a>, alongside siblings like <code>contextweaver</code>, <code>agent-kernel</code>, and <code>lessonweaver</code> — but its base install has no hard dependency on any of them and runs fully standalone.</p>
+<h2>Takeaways</h2>
+<ul>
+<li><strong>Stop paying for decisions you&#39;ve already made.</strong> Repeated, deterministic tool paths don&#39;t need a model between every step — compile them once.</li>
+<li><strong>The real win is data integrity, not speed.</strong> <code>validate → fn → validate → merge</code> makes inter-step corruption structurally impossible (0% vs. a benchmarked 61–96%). Latency and cost savings are a bonus.</li>
+<li><strong>You don&#39;t have to hand-wire flows.</strong> <code>ChainAnalyzer</code> finds schema-compatible chains offline; <code>ChainObserver</code> proposes flows from real traces. Observe → compile → replace.</li>
+<li><strong>Typed, file-serializable, auditable.</strong> Pydantic at every boundary, YAML/JSON flow files, structured per-step logs, a CLI with a stable exit-code contract.</li>
+<li><strong>Know the boundary.</strong> Keep the model for routing and open-ended reasoning; hand the deterministic interior to ChainWeaver. It complements your agent framework — it doesn&#39;t replace it.</li>
+<li><strong>It&#39;s alpha — read the caveats.</strong> ~1,600 tests and an 80% coverage gate, but the API may shift before 1.0, and the benchmark uses seeded/simulated models, not live LLM spend.</li>
+</ul>
+<p>If you run agents that repeat the same tool path turn after turn, clone the repo, run <code>python examples/naive_vs_compiled.py</code>, and see your own before/after. If the trade-off fits your workload, <strong>star <a href="https://github.com/dgenio/ChainWeaver">ChainWeaver on GitHub</a></strong>, try it on one real flow, and open an issue with what broke — alpha projects get better fastest when early users push on the edges.</p>
+
+</article></body></html>
