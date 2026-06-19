@@ -1,0 +1,136 @@
+<p><em>Single-node columnar OLAP beats a distributed cluster on mid-sized data more often than anyone admits. No shuffle, no JVM, no 4-minute cluster spin-up — and the receipts to prove it.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/cover-duckdb-vs-spark.png" alt="DuckDB Replaced My Spark Cluster for Everything Under 100GB. Here&#39;s the Math.">
+It&#39;s 9:14 a.m. You kick off a Spark job to aggregate yesterday&#39;s events — about 40GB of Parquet sitting in S3. The cluster needs to come up first. You wait. Executors register. The JVM warms. Four minutes later the job finally starts, churns through a shuffle, and writes the result. Total wall-clock: eight minutes for a <code>GROUP BY</code> that touches three columns.</p>
+<p>Then you do the part that actually stings — you open the cloud bill.</p>
+<p>I ran mid-sized batch jobs like this on Spark for years because &quot;data engineering means Spark.&quot; Then I started moving the ones under roughly 100GB to <strong>DuckDB</strong>, an in-process columnar OLAP engine that runs inside a single Python process — no cluster, no JVM, no driver/executor dance. A large share of my pipeline got faster, cheaper, and <em>dramatically</em> simpler. This is the honest breakdown: the mechanism behind why, runnable code you can paste today, and the cases where I still reach for Spark without hesitation.</p>
+<h2>The uncomfortable truth about &quot;big data&quot;</h2>
+<p>Most jobs that run on a Spark cluster are not big-data jobs. They&#39;re mid-data jobs wearing a big-data costume.</p>
+<p>A modern cloud box gives you a lot of headroom on one node. You can rent a single instance with 64–128 cores and 256GB–1TB of RAM. Against that, a 40GB Parquet dataset is not &quot;distributed computing&quot; territory — it&#39;s &quot;fits comfortably on one machine&quot; territory. When you force it through a distributed engine anyway, you pay for distribution you don&#39;t need:</p>
+<ul>
+<li><strong>Cluster acquisition.</strong> Ephemeral clusters take minutes to provision and register executors before a single byte is read.</li>
+<li><strong>JVM startup and serialization.</strong> Every executor boots a JVM. Data crosses serialization boundaries.</li>
+<li><strong>The shuffle.</strong> Any <code>GROUP BY</code>, <code>JOIN</code>, or <code>DISTINCT</code> that spans partitions triggers a shuffle — data is repartitioned and sent <em>across the network</em> between executors. On one node, there is no network.</li>
+</ul>
+<p>DuckDB skips all three. It reads Parquet directly with a vectorized, columnar engine and parallelizes across your cores using morsel-driven parallelism — the same academic lineage (MonetDB/X100, Morsel-Driven Parallelism) that modern analytical databases are built on.</p>
+<h2>The 30-second version</h2>
+<p>Here&#39;s the entire &quot;cluster&quot; for a 40GB aggregation:</p>
+<pre><code class="language-python">import duckdb
+
+# No server, no cluster. This runs in your current process.
+con = duckdb.connect()  # in-memory; or duckdb.connect(&quot;analytics.db&quot;) to persist
+
+result = con.sql(&quot;&quot;&quot;
+    SELECT
+        event_type,
+        date_trunc(&#39;day&#39;, ts) AS day,
+        count(*)              AS events,
+        approx_count_distinct(user_id) AS uniques
+    FROM read_parquet(&#39;s3://analytics/events/*/*.parquet&#39;)
+    GROUP BY event_type, day
+    ORDER BY day
+&quot;&quot;&quot;).df()   # .df() -&gt; pandas, .pl() -&gt; Polars, .arrow() -&gt; Arrow, .fetchall() -&gt; rows
+
+print(result)
+</code></pre>
+<p>That&#39;s it. <code>read_parquet</code> scans the files directly — no load step, no <code>CREATE TABLE</code>, no ingestion job. DuckDB reads multiple Parquet row groups in parallel across your CPU cores by default. The output drops straight into pandas, Polars, or Arrow with zero-copy where possible.</p>
+<p>If your data lives in S3, enable the <code>httpfs</code> extension once and point at the bucket:</p>
+<pre><code class="language-python">con.sql(&quot;INSTALL httpfs; LOAD httpfs;&quot;)
+con.sql(&quot;&quot;&quot;
+    CREATE SECRET (
+        TYPE s3,
+        KEY_ID    &#39;AKIA...&#39;,
+        SECRET    &#39;...&#39;,
+        REGION    &#39;eu-west-1&#39;
+    );
+&quot;&quot;&quot;)
+</code></pre>
+<h2>Why the single node wins: the mechanism</h2>
+<p>Don&#39;t take the speedup on faith — look at <em>where the time goes</em>. The query work is usually the smallest slice of a Spark job on mid-sized data. The expensive parts are structural overhead that simply don&#39;t exist on one node.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/duckdb-vs-spark-d1.png" alt="Where the time actually goes: a Spark job on mid-sized data spends most of its wall-clock on cluster acquisition, JVM startup, and a shuffle stage — none of which DuckDB has. The query itself is the small slice.">
+<em>Where the time actually goes: a Spark job on mid-sized data spends most of its wall-clock on cluster acquisition, JVM startup, and a shuffle stage — none of which DuckDB has. The query itself is the small slice.</em></p>
+<p>Three mechanisms do the heavy lifting:</p>
+<p><strong>1. Columnar + vectorized execution.</strong> DuckDB stores and processes data in columns, in batches (vectors) of values at a time rather than row-by-row. A <code>SELECT count(*) ... GROUP BY event_type</code> only ever touches the <code>event_type</code> column in your Parquet files — Parquet is columnar on disk, and DuckDB pushes that projection and any filters down into the scan, so unused columns and whole row groups are never read.</p>
+<p><strong>2. No shuffle.</strong> A distributed <code>GROUP BY</code> has to repartition rows by key across executors over the network — the shuffle stage. On a single node, the aggregation happens in shared memory across threads. There is no exchange operator, no network round-trip, no shuffle spill to worry about.</p>
+<p><strong>3. No JVM, no cluster.</strong> DuckDB is a C++ library that runs <em>in your process</em>. The &quot;startup cost&quot; is importing a Python package. There&#39;s nothing to provision and nothing to tear down.</p>
+<p>You can see the projection/filter pushdown yourself — this is the senior-engineer move, reading the plan instead of trusting the vibe:</p>
+<pre><code class="language-python">con.sql(&quot;&quot;&quot;
+    EXPLAIN
+    SELECT event_type, count(*)
+    FROM read_parquet(&#39;s3://analytics/events/*/*.parquet&#39;)
+    WHERE event_type = &#39;purchase&#39;
+    GROUP BY event_type
+&quot;&quot;&quot;).show()
+</code></pre>
+<p>In the plan you&#39;ll see the <code>PARQUET_SCAN</code> node reporting which columns it projects and the filter being applied at scan time — confirmation that DuckDB isn&#39;t dragging the whole dataset into memory to filter afterward.</p>
+<h3>Partition pruning is free if your data is laid out well</h3>
+<p>If your Parquet is Hive-partitioned (<code>year=2025/month=11/day=01/...</code>), filters on the partition keys prune entire directories before any file is opened:</p>
+<pre><code class="language-python">con.sql(&quot;&quot;&quot;
+    SELECT user_id, event_type, ts
+    FROM read_parquet(
+        &#39;s3://analytics/events/year=2025/month=11/day=01/*.parquet&#39;,
+        hive_partitioning = true
+    )
+    WHERE event_type = &#39;purchase&#39;
+&quot;&quot;&quot;).df()
+</code></pre>
+<p>One gotcha worth flagging: in some versions, reading Hive-partitioned data from object storage with a broad glob can enumerate all matching files first and <em>then</em> apply the partition filter, rather than touching only matching paths. Narrow your glob to the partitions you want when you can, and keep an eye on the file-listing step — it&#39;s the most common surprise when moving cloud workloads to DuckDB.</p>
+<h2>&quot;But it won&#39;t fit in memory&quot;</h2>
+<p>This is the objection that keeps people on Spark, and it&#39;s mostly outdated. DuckDB supports <strong>larger-than-memory</strong> workloads by spilling intermediates to disk. By default the <code>memory_limit</code> is set to about 80% of physical RAM; when an operator&#39;s intermediates grow past that, DuckDB adaptively spills to a temporary directory. Out-of-core support covers grouping, joining, sorting, and windowing — the operators that actually blow up.</p>
+<p>You control it explicitly:</p>
+<pre><code class="language-python">con.sql(&quot;SET memory_limit = &#39;24GB&#39;;&quot;)
+con.sql(&quot;SET temp_directory = &#39;/mnt/fast-ssd/duckdb_tmp&#39;;&quot;)
+con.sql(&quot;SET max_temp_directory_size = &#39;200GB&#39;;&quot;)  # bound the spill
+con.sql(&quot;SET threads = 16;&quot;)                        # default: your core count
+</code></pre>
+<p>Point <code>temp_directory</code> at a fast local SSD and a job whose hash tables exceed RAM still completes — it just reads and writes spill files in the background. If spilling is disabled or the temp limit is exceeded, you get a clean out-of-memory error and the query cancels, rather than silent corruption. That&#39;s the design boundary: DuckDB will work <em>past</em> memory, not infinitely past it.</p>
+<h2>A fair, reproducible comparison</h2>
+<p>If you want to convince a skeptical teammate (or yourself), don&#39;t trust a blog&#39;s numbers — including mine. Generate data and time both engines on <em>your</em> hardware. Here&#39;s a self-contained harness:</p>
+<pre><code class="language-python">import duckdb, time
+
+con = duckdb.connect()
+# Generate ~a few GB of synthetic events as partitioned Parquet
+con.sql(&quot;&quot;&quot;
+    COPY (
+        SELECT
+            (random() * 1e6)::BIGINT                          AS user_id,
+            [&#39;view&#39;,&#39;click&#39;,&#39;purchase&#39;][1 + floor(random()*3)::INT] AS event_type,
+            TIMESTAMP &#39;2025-01-01&#39; + (random()*365)::INT * INTERVAL &#39;1 day&#39; AS ts,
+            random()                                           AS amount
+        FROM range(50_000_000)
+    ) TO &#39;events.parquet&#39; (FORMAT parquet);
+&quot;&quot;&quot;)
+
+t0 = time.time()
+con.sql(&quot;&quot;&quot;
+    SELECT event_type, count(*) AS n, avg(amount) AS avg_amount
+    FROM &#39;events.parquet&#39;
+    GROUP BY event_type
+&quot;&quot;&quot;).fetchall()
+print(f&quot;DuckDB aggregate: {time.time() - t0:.2f}s&quot;)
+</code></pre>
+<p>Run the equivalent <code>groupBy().agg()</code> in PySpark against the same file, and include the cluster start time in your stopwatch — because in production, you pay that every run. For mid-sized data, the gap is usually not subtle. The mechanism in the diagram is why.</p>
+<h2>When Spark still wins (and I&#39;m not being polite)</h2>
+<p>DuckDB is a single-node engine. Past a point, one node is the wrong tool, and pretending otherwise is how you get paged at 3 a.m.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/duckdb-vs-spark-d2.png" alt="A simple decision boundary: dataset size and workload shape decide the engine. DuckDB owns the mid-data quadrant most teams actually live in.">
+<em>A simple decision boundary: dataset size and workload shape decide the engine. DuckDB owns the mid-data quadrant most teams actually live in.</em></p>
+<p>Reach for Spark when:</p>
+<ul>
+<li><strong>The data is genuinely huge.</strong> Multi-terabyte joins where even one input doesn&#39;t fit on the largest node you can rent. This is what distributed shuffle is <em>for</em>.</li>
+<li><strong>You need horizontal scale-out.</strong> Throughput that no single box delivers, or jobs that must fan out across many machines on a fixed wall-clock budget.</li>
+<li><strong>Streaming.</strong> Continuous, stateful processing belongs to Spark Structured Streaming or Flink. DuckDB is a batch/interactive engine.</li>
+<li><strong>The ecosystem is already there.</strong> A mature Spark platform — Delta Lake ACID transactions, a metastore, lineage, existing tested pipelines, a team fluent in it. &quot;Technically faster on one node&quot; rarely justifies rewriting a working, governed platform.</li>
+<li><strong>Heavy concurrent multi-user workloads.</strong> DuckDB is embedded and single-writer; it&#39;s not a shared cluster serving hundreds of concurrent analysts.</li>
+</ul>
+<p>The honest framing: <strong>size your data per job, not your ambitions.</strong> Most teams&#39; median job is far smaller than their largest, and they provision for the largest. The mid-data quadrant — the one most jobs actually live in — is where a single node quietly wins.</p>
+<p>If you&#39;re already rethinking single-node tooling, the same logic applies one layer down to your in-memory dataframes — I made the parallel case in <a href="polars-pandas">Polars vs pandas</a>, where the column-oriented, multi-threaded engine beats the row-oriented default for the same structural reasons.</p>
+<h2>Takeaways</h2>
+<ul>
+<li><strong>Under ~100GB, default to a single node.</strong> A 64–128 core box with hundreds of GB of RAM handles far more than most &quot;big data&quot; jobs need.</li>
+<li><strong>The savings are structural, not magic.</strong> No cluster spin-up, no JVM, and crucially <strong>no shuffle</strong> — DuckDB removes the overhead that dominates a Spark job&#39;s wall-clock on mid-sized data.</li>
+<li><strong>Read Parquet directly.</strong> <code>read_parquet(...)</code> with projection/filter pushdown and Hive partition pruning means you scan only the columns and files you need. Verify with <code>EXPLAIN</code>.</li>
+<li><strong>Larger-than-memory is supported.</strong> Set <code>memory_limit</code>, <code>temp_directory</code>, and <code>max_temp_directory_size</code>, point spill at a fast SSD, and out-of-core grouping/join/sort/window jobs complete.</li>
+<li><strong>Keep Spark for truly huge, streaming, multi-user, and mature-platform workloads.</strong> Use the decision quadrant, not habit.</li>
+<li><strong>Benchmark on your own data</strong> — including cluster start time in the stopwatch, because you pay it every run.</li>
+</ul>
+<p>I&#39;m not anti-Spark. I&#39;m anti-paying-for-a-cluster-to-<code>GROUP BY</code>-40GB. Try moving one mid-sized job to DuckDB this week, put <code>EXPLAIN</code> in front of it, and time it honestly against your current pipeline.</p>
+<p>If you do — what was the job, and what did the numbers say? I read every reply. Follow for more practical, numbers-first data engineering, and tell me where this broke for you, because that&#39;s where the next article comes from.</p>

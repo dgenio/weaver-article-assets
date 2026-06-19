@@ -1,0 +1,167 @@
+<p><em>Peeking, multiple comparisons, Simpson&#39;s paradox, sample-ratio mismatch, novelty effects, and underpowered tests — the mechanism behind each, plus runnable checks in Python.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/cover-ab-test-pitfalls.png" alt="Your A/B Test Is Lying to You: 6 Pitfalls and How to Catch Them">
+You ship a button-color change. Three days in, the dashboard lights up green: <strong>+5.2% conversion, p = 0.04</strong>. You call the win in standup, the PM updates the roadmap, and the feature rolls to 100%.</p>
+<p>Six weeks later the metric is flat. The lift evaporated. Nobody can explain it, so everyone quietly agrees the effect &quot;regressed&quot; and moves on.</p>
+<p>It didn&#39;t regress. It was never there. Your A/B test lied to you — and it lied in one of a handful of completely predictable ways. The good news: each failure mode has a name, a mechanism, and a check you can run in a few lines of code. This article walks through six of them. None of the math is exotic; all of it is the kind of thing that silently ships losers as winners.</p>
+<p>I&#39;ll show the <em>mechanism</em> behind each pitfall, not a parade of made-up benchmark numbers. Where I cite a figure, it&#39;s either a documented statistical fact or an illustrative simulation you can rerun yourself.</p>
+<h2>Pitfall 1: Peeking (optional stopping)</h2>
+<p>This is the most common and most expensive mistake, because it feels like diligence.</p>
+<p>Here&#39;s the trap. A p-value threshold of 0.05 guarantees a 5% false-positive rate <strong>if you look exactly once, at a sample size you fixed in advance.</strong> The instant you check the test repeatedly and stop &quot;as soon as it&#39;s significant,&quot; you&#39;ve broken that guarantee. Each peek is another roll of the dice. Under the null hypothesis (no real difference), the test statistic wanders like a random walk; given enough chances, it <em>will</em> cross the 1.96 line by chance alone.</p>
+<p>You can see it in a quick simulation. Generate two identical groups (no real effect), then check at multiple points and stop the first time <code>p &lt; 0.05</code>:</p>
+<pre><code class="language-python">import numpy as np, math
+
+def false_positive_rate(n_peeks, n_max=10_000, trials=4000, seed=0):
+    rng = np.random.default_rng(seed)
+    checkpoints = np.linspace(n_max // n_peeks, n_max, n_peeks).astype(int)
+    false_positives = 0
+    for _ in range(trials):
+        a = rng.binomial(1, 0.10, n_max)   # both arms: TRUE rate = 10%
+        b = rng.binomial(1, 0.10, n_max)   # there is NO real difference
+        for cp in checkpoints:
+            xa, xb = a[:cp], b[:cp]
+            p = (xa.sum() + xb.sum()) / (2 * cp)
+            se = math.sqrt(p * (1 - p) * 2 / cp)
+            if se and abs((xa.mean() - xb.mean()) / se) &gt; 1.96:
+                false_positives += 1
+                break  # stop the moment it&#39;s &quot;significant&quot;
+    return false_positives / trials
+
+for k in (1, 5, 10):
+    print(f&quot;{k:2d} look(s): false-positive rate = {false_positive_rate(k):.1%}&quot;)
+</code></pre>
+<p>Run it and you&#39;ll get roughly:</p>
+<pre><code> 1 look(s): false-positive rate = 5.1%
+ 5 look(s): false-positive rate = 14.3%
+10 look(s): false-positive rate = 20.2%
+</code></pre>
+<p>One look gives you the 5% you signed up for. Ten looks quadruples it. With <em>continuous</em> monitoring the false-positive rate eventually approaches 100% — wait long enough and almost any null test will cross the line at some point.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/ab-test-pitfalls-d1.png" alt="How peeking inflates the false-positive rate. Each time you check an ongoing test and stop the moment p &lt; 0.05, you give the random walk another chance to cross the significance line. One look ≈ 5% false positives; repeated looks push it far higher.">
+<em>How peeking inflates the false-positive rate. Each time you check an ongoing test and stop the moment p &lt; 0.05, you give the random walk another chance to cross the significance line. One look ≈ 5% false positives; repeated looks push it far higher.</em></p>
+<p><strong>The fix.</strong> Pick one of these, not none of them:</p>
+<ul>
+<li><strong>Fix the sample size in advance</strong> and only judge the test when it&#39;s reached (see Pitfall 6 for how to compute it). Boring, robust, free.</li>
+<li><strong>Use a sequential test designed for continuous monitoring</strong> — group sequential boundaries (O&#39;Brien–Fleming, Pocock) or an always-valid approach like mSPRT / confidence sequences. These spend your alpha across looks on purpose, so peeking is <em>allowed</em> by construction. Several commercial platforms (&quot;sequential testing,&quot; &quot;always-valid p-values&quot;) implement exactly this.</li>
+</ul>
+<p>What you cannot do is eyeball a fixed-horizon p-value every morning and stop when you like the number.</p>
+<h2>Pitfall 2: Multiple comparisons</h2>
+<p>You test one variant but track ten metrics. Or you run one experiment with five variants. Or you slice the result across eight segments looking for &quot;where it worked.&quot; Every one of those is multiple comparisons, and each additional test you run at α = 0.05 adds another ~5% shot at a false positive.</p>
+<p>The family-wise error rate — the probability of <em>at least one</em> false positive across <code>m</code> independent tests — is <code>1 − (1 − α)^m</code>:</p>
+<pre><code class="language-python">for m in (1, 5, 10, 20):
+    fwer = 1 - (1 - 0.05) ** m
+    print(f&quot;{m:2d} tests: P(at least one false positive) = {fwer:.0%}&quot;)
+# 1 tests: 5%   5 tests: 23%   10 tests: 40%   20 tests: 64%
+</code></pre>
+<p>Ten metrics and you&#39;re more likely than not to find <em>something</em> &quot;significant&quot; in a test where nothing is real. This is how &quot;the variant didn&#39;t move the primary metric, but it did lift 7-day retention!&quot; gets reported as a win.</p>
+<p><strong>The fix.</strong> Decide what counts <em>before</em> you peek at results:</p>
+<ul>
+<li>Declare <strong>one primary metric</strong> up front. Everything else is a secondary/guardrail metric that can generate hypotheses but not decisions.</li>
+<li>When you genuinely must test many hypotheses, correct for it. <strong>Bonferroni</strong> (test each at <code>α/m</code>) is dead simple and conservative. <strong>Benjamini–Hochberg</strong> controls the false discovery rate and is far less brutal when you have many tests:</li>
+</ul>
+<pre><code class="language-python">from statsmodels.stats.multitest import multipletests
+pvals = [0.001, 0.013, 0.021, 0.04, 0.31, 0.55]
+reject, p_adj, *_ = multipletests(pvals, alpha=0.05, method=&quot;fdr_bh&quot;)
+print(list(zip(reject, p_adj.round(3))))
+</code></pre>
+<p>(<code>pip install statsmodels</code> if you don&#39;t have it; for Bonferroni pass <code>method=&quot;bonferroni&quot;</code>.)</p>
+<h2>Pitfall 3: Simpson&#39;s paradox (segmentation)</h2>
+<p>The variant wins overall. You drill into segments to celebrate, and discover it <em>loses</em> on mobile, <em>loses</em> on desktop, <em>loses</em> in every country. How can it lose everywhere yet win overall?</p>
+<p>Because the aggregate rate is a weighted average of segment rates, and the <strong>weights</strong> can flip the conclusion. If your variant happens to be served disproportionately to a high-converting segment, it inherits that segment&#39;s high rate without being any better.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/ab-test-pitfalls-d2.png" alt="Simpson&#39;s paradox: B beats A inside every segment, yet A wins overall because the segments are mixed in different proportions. The aggregate is a weighted average of the segments, and the weights — not the rates — flip the sign.">
+<em>Simpson&#39;s paradox: B beats A inside every segment, yet A wins overall because the segments are mixed in different proportions. The aggregate is a weighted average of the segments, and the weights — not the rates — flip the sign.</em></p>
+<pre><code class="language-python">import pandas as pd
+# B converts BETTER in every segment, yet A wins overall
+data = pd.DataFrame([
+    (&quot;Mobile&quot;,  &quot;A&quot;,  2,  100),   # 2.0%
+    (&quot;Mobile&quot;,  &quot;B&quot;, 30, 1000),   # 3.0%  B better
+    (&quot;Desktop&quot;, &quot;A&quot;, 90,  900),   # 10.0%
+    (&quot;Desktop&quot;, &quot;B&quot;, 12,  100),   # 12.0% B better
+], columns=[&quot;segment&quot;, &quot;arm&quot;, &quot;conv&quot;, &quot;n&quot;])
+
+overall = data.groupby(&quot;arm&quot;).apply(
+    lambda d: d.conv.sum() / d.n.sum(), include_groups=False)
+print(overall)         # A ~9.2%,  B ~3.8%  -&gt; A &quot;wins&quot;
+print((data.assign(rate=lambda d: d.conv / d.n)
+           .pivot(index=&quot;segment&quot;, columns=&quot;arm&quot;, values=&quot;rate&quot;)))
+# every segment: B &gt; A
+</code></pre>
+<p>A converts at ~9.2% overall, B at ~3.8% — yet B is better in <em>every</em> segment. The trap is the mix: B&#39;s traffic was mostly low-converting mobile, A&#39;s was mostly high-converting desktop.</p>
+<p><strong>The fix.</strong> Simpson&#39;s paradox in an experiment is almost always a <strong>symptom of broken randomization or biased assignment</strong> — proper randomization makes segment mixes equal in expectation, so the paradox shouldn&#39;t appear. So:</p>
+<ol>
+<li><strong>Check the segment mix between arms first.</strong> If the variant has 60% mobile and control has 40% mobile, your assignment is broken (this is also Pitfall 4). Fix the plumbing before you trust any number.</li>
+<li>If mixes are genuinely equal, report <strong>segment-level results</strong> alongside the aggregate, and use a model (e.g., logistic regression with a segment term, or CUPED-style adjustment) rather than a raw pooled mean.</li>
+</ol>
+<h2>Pitfall 4: Sample-ratio mismatch (SRM)</h2>
+<p>You designed a 50/50 split. You got 50.4 / 49.6. Sounds fine. It is not necessarily fine.</p>
+<p>SRM is the single best &quot;is my experiment trustworthy at all?&quot; check, and almost nobody runs it. If the ratio of users between arms differs from what you intended by more than chance allows, <strong>something in your assignment, logging, or filtering is broken</strong> — a redirect that drops slow connections, a bot filter that hits one arm harder, an SDK that fails to fire for one variant. When the <em>populations</em> differ, every downstream metric is suspect, because you&#39;re no longer comparing like with like.</p>
+<p>The test is a one-line chi-square goodness-of-fit against your intended ratio:</p>
+<pre><code class="language-python">from scipy.stats import chisquare
+def srm_check(counts, expected_ratio=(0.5, 0.5)):
+    n = sum(counts)
+    expected = [n * r for r in expected_ratio]
+    chi2, p = chisquare(f_obs=counts, f_exp=expected)
+    flag = &quot;SRM! investigate before trusting results&quot; if p &lt; 0.001 else &quot;ok&quot;
+    return round(chi2, 2), round(p, 6), flag
+
+print(srm_check([10_100, 9_900]))   # tiny skew -&gt; (2.0, 0.157, &#39;ok&#39;)
+print(srm_check([10_500, 9_500]))   # 52.5/47.5 -&gt; (50.0, 0.0, &#39;SRM!&#39;)
+</code></pre>
+<p>A 52.5/47.5 split on 20,000 users — which doesn&#39;t look alarming at a glance — gives a p-value below 0.000001. That is not noise; that is a bug. The convention is to alarm at <strong>p &lt; 0.001</strong> (you&#39;re checking it on every test, so use a strict threshold to avoid false alarms).</p>
+<p><strong>The fix.</strong> When SRM fires, <em>stop analyzing the metric and go debug the pipeline.</em> Common culprits: redirect-based variants (the redirect itself causes drop-off), assignment happening before a filter that&#39;s correlated with the variant, bot/duplicate filtering applied unevenly, or logging that races. Do not &quot;adjust for it&quot; statistically — find the leak.</p>
+<h2>Pitfall 5: Novelty and primacy effects</h2>
+<p>Your new design shows a beautiful +8% in week one. By week three it&#39;s +1%. The effect was real — it just wasn&#39;t <em>durable.</em></p>
+<p>Two opposite biases live here:</p>
+<ul>
+<li><strong>Novelty effect:</strong> existing users click the shiny new thing because it&#39;s new, not because it&#39;s better. The lift decays as novelty wears off.</li>
+<li><strong>Primacy effect:</strong> existing users are <em>confused</em> by the change and underperform at first, then recover — making a good change look flat or negative early on.</li>
+</ul>
+<p>Both come from the same root: <strong>your experiment population is dominated by existing users reacting to <em>change itself</em>, not to the steady-state experience a new user would have.</strong></p>
+<p><strong>The fix.</strong> You don&#39;t need fancy math — you need to look at the effect <em>over time</em> and <em>by user tenure</em>:</p>
+<pre><code class="language-python">import pandas as pd
+# daily lift of variant vs control; is it stable or decaying?
+def lift_by_day(df):  # df cols: day, arm, converted
+    daily = (df.groupby([&quot;day&quot;, &quot;arm&quot;]).converted.mean()
+               .unstack(&quot;arm&quot;))
+    daily[&quot;lift_%&quot;] = (daily[&quot;B&quot;] / daily[&quot;A&quot;] - 1) * 100
+    return daily.round(3)
+# A decaying &#39;lift_%&#39; column (8 -&gt; 5 -&gt; 2 -&gt; 1) is the novelty fingerprint.
+</code></pre>
+<p>Then, concretely:</p>
+<ul>
+<li><strong>Segment by new vs. returning users.</strong> The clean read on a permanent change is its effect on <strong>users who first saw it as new</strong> — they have no &quot;old experience&quot; to react to. If the effect holds for new users but not returning ones, you&#39;re looking at novelty/primacy.</li>
+<li><strong>Run the test long enough for the curve to flatten</strong> (typically at least one to two full business cycles — often a couple of weeks), and judge the <em>stabilized</em> lift, not the week-one spike.</li>
+</ul>
+<h2>Pitfall 6: Ignoring variance / underpowered tests</h2>
+<p>This is the quietest killer. An underpowered test isn&#39;t just &quot;might miss a real effect&quot; — when an underpowered test <em>does</em> hit significance, the estimated effect is <strong>inflated</strong> (the &quot;winner&#39;s curse&quot;). You only cross the line on a lucky draw, so the lift you report is systematically too big. That&#39;s a major reason wins don&#39;t replicate.</p>
+<p>Power is just: given the effect size you care about, how likely are you to detect it? You should compute the required sample size <strong>before</strong> launching. For a two-proportion test:</p>
+<pre><code class="language-python">import math
+from statsmodels.stats.proportion import proportion_effectsize
+from statsmodels.stats.power import NormalIndPower
+
+def per_arm_n(baseline, mde_abs, alpha=0.05, power=0.8):
+    es = proportion_effectsize(baseline, baseline + mde_abs)
+    n = NormalIndPower().solve_power(
+        effect_size=es, alpha=alpha, power=power, alternative=&quot;two-sided&quot;)
+    return math.ceil(n)
+
+print(per_arm_n(0.10, 0.010))  # detect 10.0%-&gt;11.0%  -&gt; ~14,700 / arm
+print(per_arm_n(0.10, 0.005))  # detect 10.0%-&gt;10.5%  -&gt; ~57,800 / arm
+</code></pre>
+<p>Detecting a 1-percentage-point lift on a 10% baseline needs roughly <strong>15,000 users per arm</strong>; halving the effect you want to catch <em>quadruples</em> the sample. If your traffic can&#39;t reach that in a reasonable window, you do not have a powered test — you have a coin flip with a dashboard.</p>
+<p><strong>The fix.</strong></p>
+<ul>
+<li><strong>Run a power calculation before every test.</strong> If the required n is unreachable, either widen the minimum detectable effect you&#39;ll commit to, or don&#39;t run the test.</li>
+<li><strong>Reduce variance instead of just adding users.</strong> This is where <a href="cuped">CUPED</a> earns its keep: by adjusting each user&#39;s metric with their pre-experiment behavior, it strips out variance you can predict, often cutting required sample size by a meaningful chunk. Lower variance is mathematically identical to more power — it&#39;s the cheapest power you&#39;ll ever buy.</li>
+<li><strong>Treat a lucky-looking win from a tiny sample with suspicion.</strong> A +40% lift on 200 users per arm is far more likely to be noise than a real 40% effect.</li>
+</ul>
+<h2>The 60-second pre-flight checklist</h2>
+<p>Before you trust any A/B result, run these in order. The first failure stops the line.</p>
+<ul>
+<li><strong>SRM check.</strong> Chi-square the arm counts against your intended split. <code>p &lt; 0.001</code> → broken pipeline, fix it before reading anything else.</li>
+<li><strong>Did you peek?</strong> If you stopped early on a fixed-horizon test, the p-value is not valid. Use a sequential method or wait for the pre-set n.</li>
+<li><strong>One primary metric?</strong> If you&#39;re celebrating a secondary metric or a segment, correct for multiple comparisons (BH / Bonferroni).</li>
+<li><strong>Segment mix equal across arms?</strong> Unequal mix → Simpson&#39;s paradox risk and likely an assignment bug.</li>
+<li><strong>Is the effect stable over time and for new users?</strong> A decaying lift is novelty, not value.</li>
+<li><strong>Was the test powered?</strong> Compute required n in advance. A significant result from an underpowered test is probably inflated.</li>
+</ul>
+<p>None of these checks take real effort. What takes effort is unwinding a feature you shipped on a number that was never real — explaining to a roomful of people why the +5.2% turned into nothing. Run the checklist instead.</p>
+<p>If this saved you from shipping a fake win, follow me for more practical experimentation and data-engineering writeups — and tell me in the comments: which of these six has burned you the worst? I&#39;ve personally lost the most sleep to SRM.</p>

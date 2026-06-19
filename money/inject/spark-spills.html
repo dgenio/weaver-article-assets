@@ -1,0 +1,126 @@
+<p><em>Spill is the silent tax on every shuffle. Here&#39;s how to read it in the Spark UI and tune it away with shuffle partitions, salting, and repartition vs. coalesce.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/cover-spark-spills.png" alt="Stop Your Spark Jobs From Spilling to Disk: A Practical Guide to Partitions, Skew, and the 128MB Rule">
+You kick off a Spark job that should take five minutes. Forty minutes later it&#39;s still grinding, your executors are pinned, and the only thing the logs tell you is that <em>something</em> is happening. You open the Spark UI, scroll to the stage detail, and there it is in the task metrics: <strong>Spill (Memory)</strong> and <strong>Spill (Disk)</strong>, both with uncomfortably large numbers next to them.</p>
+<p>That&#39;s the job quietly writing intermediate data to local disk because it ran out of memory to hold it. Spill is one of the most common reasons a Spark job is slow without ever throwing an error. It doesn&#39;t fail — it just drags, because you&#39;ve traded fast RAM for slow disk I/O in the middle of a shuffle, often serializing and re-reading gigabytes you never needed to.</p>
+<p>This guide is about recognizing spill, understanding <em>why</em> it happens, and the handful of knobs that actually fix it. No magic config that makes everything fast — just the mechanism and the trade-offs.</p>
+<h2>What &quot;spill&quot; actually means</h2>
+<p>When Spark executes a wide operation — a <code>groupBy</code>, a join, a <code>sort</code>, a window — each task needs working memory to build hash maps, sort buffers, and aggregation state. That working memory comes from the executor&#39;s <strong>execution memory</strong> pool.</p>
+<p>If a task&#39;s working set is larger than the execution memory available to it, Spark doesn&#39;t just crash (most of the time). It spills: it sorts/serializes what it has, writes it to local disk, frees the memory, and keeps going. Later it reads those spill files back and merges them. The job completes — it&#39;s just paying disk I/O and extra serialization for the privilege.</p>
+<p>In the Spark UI you&#39;ll see two numbers per stage:</p>
+<ul>
+<li><strong>Spill (Memory)</strong> — the <em>in-memory</em> (deserialized) size of the data that was spilled. This is usually the bigger, scarier-looking number.</li>
+<li><strong>Spill (Disk)</strong> — the actual <em>serialized, compressed</em> bytes written to disk.</li>
+</ul>
+<p>The disk number is what hits your I/O. The memory number tells you how badly the data overflowed its in-RAM footprint. Both being non-zero across many tasks is your signal.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/spark-spills-d1.png" alt="Where spill happens: a task&#39;s data outgrows its execution-memory slice and overflows to disk, twice (once in memory representation, once serialized on disk).">
+<em>Where spill happens: a task&#39;s data outgrows its execution-memory slice and overflows to disk, twice (once in memory representation, once serialized on disk).</em></p>
+<p>A subtle but important point: execution memory and storage memory (for cached/persisted blocks) share a single <strong>unified</strong> region in modern Spark. The boundary floats. So aggressively caching DataFrames you don&#39;t need can starve execution memory and <em>cause</em> spill. If you&#39;re spilling and also caching a lot, un-cache first and re-measure.</p>
+<h2>The usual root cause: partitions are the wrong size</h2>
+<p>Spill is almost always a partition-sizing problem in disguise. A Spark stage processes data in partitions, one task per partition. If each partition is too big to fit in a task&#39;s slice of execution memory, you spill. So the lever is: <strong>how many partitions, and therefore how big is each one.</strong></p>
+<p>The single most impactful default here is <code>spark.sql.shuffle.partitions</code>, which controls how many partitions exist <em>after</em> a shuffle (joins, aggregations, repartitions). Its default is <strong>200</strong>, and it has been 200 for years regardless of your data size or cluster size.</p>
+<p>That default is the source of an enormous amount of pain:</p>
+<ul>
+<li>Shuffling <strong>2 TB</strong> through 200 partitions means each post-shuffle partition is ~10 GB. No task holds 10 GB in memory. Massive spill.</li>
+<li>Shuffling <strong>200 MB</strong> through 200 partitions means each partition is ~1 MB. Now you have 200 near-empty tasks, each with scheduling overhead, producing 200 tiny output files.</li>
+</ul>
+<p>Neither is what you want.</p>
+<h3>The 128MB rule of thumb</h3>
+<p>A practical target is roughly <strong>128 MB of input per partition</strong> for a shuffle stage — the same order of magnitude as a default HDFS/Parquet block. It&#39;s not sacred (anywhere from ~100–200 MB is reasonable), but it&#39;s a good starting anchor: big enough that per-task overhead is negligible, small enough to comfortably fit in execution memory without spilling.</p>
+<p>The math is simple:</p>
+<pre><code class="language-python">target_partitions = ceil(total_shuffle_input_bytes / (128 * 1024 * 1024))
+</code></pre>
+<p>So if a stage shuffles ~64 GB, you want roughly <code>64 * 1024 / 128 = 512</code> partitions — not 200, and certainly not the 20 you&#39;d get if you&#39;d manually coalesced upstream.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/spark-spills-d2.png" alt="Partition size is a Goldilocks problem. Too few partitions overflow memory and spill; too many drown the scheduler in tiny tasks. Aim for the middle.">
+<em>Partition size is a Goldilocks problem. Too few partitions overflow memory and spill; too many drown the scheduler in tiny tasks. Aim for the middle.</em></p>
+<p>Here&#39;s how to set it. You can set the SQL conf globally, or — better — size it per query based on the actual data volume:</p>
+<pre><code class="language-python">from pyspark.sql import SparkSession
+import math
+
+spark = SparkSession.builder.getOrCreate()
+
+# Global default — fine as a baseline, but it&#39;s one number for every shuffle.
+spark.conf.set(&quot;spark.sql.shuffle.partitions&quot;, 512)
+
+# Better: size it from the data you&#39;re about to shuffle.
+def target_shuffle_partitions(approx_bytes, target_mb=128):
+    return max(1, math.ceil(approx_bytes / (target_mb * 1024 * 1024)))
+
+# e.g. you know (or estimate) the join input is ~64 GB
+n = target_shuffle_partitions(64 * 1024**3)   # -&gt; 512
+spark.conf.set(&quot;spark.sql.shuffle.partitions&quot;, n)
+</code></pre>
+<h3>Let Spark do it for you: Adaptive Query Execution</h3>
+<p>Since Spark 3.0, <strong>Adaptive Query Execution (AQE)</strong> can coalesce shuffle partitions automatically <em>after</em> it sees the real post-shuffle sizes. It&#39;s enabled by default in Spark 3.2+. If you&#39;re on a modern version, turn these on and let them carry most of the load:</p>
+<pre><code class="language-python">spark.conf.set(&quot;spark.sql.adaptive.enabled&quot;, True)
+spark.conf.set(&quot;spark.sql.adaptive.coalescePartitions.enabled&quot;, True)
+# The target size AQE aims for per coalesced partition:
+spark.conf.set(&quot;spark.sql.adaptive.advisoryPartitionSizeInBytes&quot;, &quot;128m&quot;)
+</code></pre>
+<p>AQE solves the &quot;too many tiny partitions&quot; case very well: you can set <code>spark.sql.shuffle.partitions</code> high (say 2000) and AQE will coalesce down to sensible sizes based on actual data. It also has a skew-join feature (<code>spark.sql.adaptive.skewJoin.enabled</code>) that splits oversized partitions. AQE is the first thing to check before you hand-tune anything — but it works off Spark&#39;s size estimates, so it&#39;s not a substitute for understanding your data. To see what AQE actually did, read the final physical plan (more on that in the companion piece on <a href="spark-physical-plan">reading the Spark physical plan</a>).</p>
+<h2>When the problem is skew, not size</h2>
+<p>Sometimes your <em>average</em> partition is fine but one or two are enormous. This is <strong>data skew</strong>: one key (or a few) dominates. A classic case is joining on a column where <code>NULL</code>, <code>0</code>, or <code>&quot;unknown&quot;</code> accounts for 60% of the rows. All those rows hash to the same partition, one task gets buried, it spills hard (or OOMs), and the whole stage waits on that one straggler while everything else sits idle.</p>
+<p>You&#39;ll spot it in the Spark UI immediately: in the stage&#39;s task table, sort by duration or by shuffle read size. If the <strong>max</strong> is 50x the <strong>median</strong>, you have skew, not a sizing problem. Bumping <code>shuffle.partitions</code> won&#39;t help — the hot key still lands in one partition.</p>
+<p>The fix is <strong>salting</strong>: break the hot key into N sub-keys so its rows spread across N partitions, then undo the split after the join.</p>
+<pre><code class="language-python">from pyspark.sql import functions as F
+
+SALT = 16  # spread each key across 16 partitions
+
+# Big, skewed side: add a random salt bucket to the join key.
+facts_salted = facts.withColumn(
+    &quot;salt&quot;, (F.rand() * SALT).cast(&quot;int&quot;)
+)
+
+# Small / dimension side: replicate each row across all salt buckets
+# so every salted fact row still finds its match.
+salt_range = spark.range(SALT).withColumnRenamed(&quot;id&quot;, &quot;salt&quot;)
+dims_salted = dims.crossJoin(salt_range)
+
+# Join on the original key PLUS the salt.
+result = (
+    facts_salted.join(dims_salted, on=[&quot;join_key&quot;, &quot;salt&quot;], how=&quot;inner&quot;)
+                .drop(&quot;salt&quot;)
+)
+</code></pre>
+<p>The trade-off is real: you&#39;ve inflated the small side by <code>SALT</code>x (the <code>crossJoin</code>), so don&#39;t salt blindly. Salt only when you&#39;ve confirmed skew, and only salt the keys that are actually hot — a common refinement is to salt <em>just</em> the known heavy keys and leave the rest untouched. And before you write any of this by hand, try AQE&#39;s skew-join handling; on Spark 3.2+ it resolves a lot of skew automatically by splitting the large partitions for you.</p>
+<h2><code>repartition</code> vs. <code>coalesce</code>: pick the right tool</h2>
+<p>Two operations change partition counts, and people reach for the wrong one constantly.</p>
+<ul>
+<li><strong><code>repartition(n)</code></strong> triggers a <strong>full shuffle</strong> and gives you <code>n</code> roughly <em>even</em> partitions. Use it to <em>increase</em> partitions, or to fix skew/uneven sizing, or to repartition by a column (<code>repartition(&quot;country&quot;)</code>) before a write. It costs a shuffle, but it produces balanced output.</li>
+<li><strong><code>coalesce(n)</code></strong> <strong>only decreases</strong> partitions and <strong>avoids a full shuffle</strong> by merging adjacent partitions on the same executor. It&#39;s cheap, but it can produce <em>uneven</em> partitions, and if you coalesce too aggressively right before a heavy computation, you&#39;ve just made each partition huge — hello, spill.</li>
+</ul>
+<pre><code class="language-python"># Increasing partitions or rebalancing: must shuffle.
+df_balanced = df.repartition(512)
+df_by_key   = df.repartition(512, &quot;customer_id&quot;)   # also sets up the join
+
+# Reducing partitions cheaply (e.g. before writing fewer output files):
+df_few_files = df.coalesce(10)
+</code></pre>
+<p>The classic spill-by-accident: you <code>coalesce(1)</code> to get a single output file, and that one task now has to hold the entire dataset in memory. It spills, or dies. If you need few output files <em>and</em> you&#39;re doing real work, <code>repartition</code> to a sane number and accept the shuffle, or write normally and compact afterward.</p>
+<h2>A repeatable workflow for killing spill</h2>
+<ol>
+<li><strong>Confirm it&#39;s spill.</strong> Open the Spark UI → Stages → the slow stage. Look at the aggregated <strong>Spill (Memory)</strong> / <strong>Spill (Disk)</strong> metrics and the per-task table.</li>
+<li><strong>Check for skew first.</strong> Sort tasks by shuffle-read size. Max ≫ median → skew → salt (or enable AQE skew join). Don&#39;t touch partition counts yet.</li>
+<li><strong>If it&#39;s uniform spill, it&#39;s sizing.</strong> Estimate the stage&#39;s shuffle input bytes and target ~128 MB per partition. Set <code>spark.sql.shuffle.partitions</code> accordingly, or lean on AQE coalescing.</li>
+<li><strong>Enable AQE</strong> (Spark 3.2+) before hand-tuning. It often fixes both the too-many and too-few cases on its own.</li>
+<li><strong>Re-measure.</strong> Re-run and confirm the spill metrics dropped. If you cache heavily, un-cache and check whether storage memory was starving execution memory.</li>
+</ol>
+<h2>When NOT to chase spill</h2>
+<p>Some spill is fine. A little spill at the tail of a large sort or aggregation is not worth a week of tuning — Spark is <em>designed</em> to spill rather than fail, and that&#39;s a feature. Chase it when:</p>
+<ul>
+<li>spill is large relative to your data (you&#39;re writing back a big multiple of the input), or</li>
+<li>it&#39;s on the critical path of a job you run constantly, or</li>
+<li>it&#39;s paired with skew that&#39;s causing one straggler task to gate the whole stage.</li>
+</ul>
+<p>If a nightly batch job spills modestly and finishes well within its window, leave it alone and go fix something that matters. Over-partitioning to chase the last byte of spill just trades it for scheduler overhead and a pile of tiny files.</p>
+<h2>Takeaways</h2>
+<ul>
+<li><strong>Spill = memory overflow to disk.</strong> It rarely errors; it just makes jobs slow. Find it in the Spark UI under Spill (Memory) and Spill (Disk).</li>
+<li><strong><code>spark.sql.shuffle.partitions</code> defaults to 200</strong> regardless of data size. For big shuffles that&#39;s far too few; for tiny ones it&#39;s too many.</li>
+<li><strong>Target ~128 MB per partition</strong>: <code>partitions ≈ ceil(shuffle_input_bytes / 128MB)</code>.</li>
+<li><strong>Enable AQE</strong> (default on in Spark 3.2+) to auto-coalesce partitions and handle a lot of skew — check it before hand-tuning.</li>
+<li><strong>Skew needs salting, not more partitions.</strong> Confirm with max-vs-median task size, then salt only the hot keys.</li>
+<li><strong><code>repartition</code> shuffles for even partitions; <code>coalesce</code> cheaply reduces them but can create giant, spill-prone partitions.</strong> Never <code>coalesce(1)</code> before heavy work.</li>
+<li><strong>Don&#39;t over-optimize.</strong> Tolerable spill on a job that meets its SLA is not a bug.</li>
+</ul>
+<p>If you want to actually <em>see</em> how Spark decides to shuffle, join, and partition — and whether AQE kicked in — the next step is learning to read the query plan. I cover that in the companion piece on <a href="spark-physical-plan">reading the Spark physical plan</a>.</p>
+<p>What&#39;s the worst spill you&#39;ve debugged — and what finally fixed it? Follow for more practical Spark tuning, and try the workflow above on your slowest stage this week.</p>

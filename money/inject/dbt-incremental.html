@@ -1,0 +1,184 @@
+<p><em>A senior engineer&#39;s guide to is_incremental(), the four incremental_strategy options, late-arriving data, and the max(updated_at) trap that silently drops rows.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/cover-dbt-incremental.png" alt="dbt Incremental Models That Actually Save Time (Not Just CPU)">
+It&#39;s 3 a.m. and your <code>orders</code> model has been running for forty minutes. It&#39;s a fact table with 2 billion rows, and every nightly run rebuilds all of it from scratch — re-scanning two years of history to add one day of new orders. The warehouse bill has a hockey-stick shape. The on-call engineer (you) is refreshing the dbt Cloud run page like it owes them money.</p>
+<p>This is the exact problem incremental models solve. Instead of <code>CREATE TABLE AS SELECT *</code>, you process only the rows that arrived since the last run and graft them onto the existing table. Done right, a nightly run touches one day of data instead of two years.</p>
+<p>Done <em>wrong</em>, you silently drop rows for weeks and nobody notices until finance asks why March revenue dropped 4%.</p>
+<p>This article is the version of incremental models I wish someone had handed me earlier: the mechanism, real model code you can paste, the four strategies and when each is correct, and the classic <code>max(updated_at)</code> pattern along with the two bugs it quietly ships with.</p>
+<h2>The mechanism, in one model</h2>
+<p>Here&#39;s a complete, runnable incremental model. Everything else in this article is a variation on it.</p>
+<pre><code class="language-sql">-- models/marts/fct_orders.sql
+{{
+    config(
+        materialized=&#39;incremental&#39;,
+        unique_key=&#39;order_id&#39;,
+        incremental_strategy=&#39;merge&#39;,
+        on_schema_change=&#39;append_new_columns&#39;
+    )
+}}
+
+select
+    order_id,
+    customer_id,
+    order_status,
+    order_total,
+    updated_at
+from {{ ref(&#39;stg_orders&#39;) }}
+
+{% if is_incremental() %}
+
+  -- only on incremental runs: filter to rows newer than what we have
+  where updated_at &gt;= (
+      select coalesce(max(updated_at), &#39;1900-01-01&#39;) from {{ this }}
+  )
+
+{% endif %}
+</code></pre>
+<p>Two pieces of dbt magic are doing the work:</p>
+<ul>
+<li><strong><code>{{ this }}</code></strong> is a Jinja reference to the model&#39;s own current table in the warehouse — the version from the <em>last</em> run. You&#39;re querying yesterday&#39;s output to decide what&#39;s new.</li>
+<li><strong><code>{% if is_incremental() %}</code></strong> wraps the filter so it&#39;s applied only on incremental runs. On the very first run (or a full refresh) there&#39;s no table to compare against, so the filter is skipped and you build everything.</li>
+</ul>
+<h2>How <code>is_incremental()</code> actually decides</h2>
+<p>This is the part people get fuzzy on, and it causes real bugs. Per the dbt docs, <code>is_incremental()</code> returns <code>True</code> only when <strong>all three</strong> of these are true:</p>
+<ol>
+<li>The model is configured with <code>materialized=&#39;incremental&#39;</code>.</li>
+<li>The target table <strong>already exists</strong> in the database.</li>
+<li>The <code>--full-refresh</code> flag was <strong>not</strong> passed for this run.</li>
+</ol>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/dbt-incremental-d1.png" alt="How dbt decides whether to run the incremental branch. is_incremental() is true only when all three conditions hold; otherwise the model does a full build.">
+<em>How dbt decides whether to run the incremental branch. is_incremental() is true only when all three conditions hold; otherwise the model does a full build.</em></p>
+<p>The practical consequence: <strong>your SQL must be valid in both branches.</strong> dbt compiles the full query whether or not the <code>if</code> block runs. A common mistake is referencing a column or CTE inside the incremental branch that doesn&#39;t exist on the first full build — it works for weeks, then someone drops the table and the &quot;first run&quot; fails.</p>
+<p>Want to force a clean rebuild? That&#39;s <code>--full-refresh</code>:</p>
+<pre><code class="language-bash">dbt run --select fct_orders --full-refresh
+</code></pre>
+<p>This <strong>drops and recreates</strong> the table from scratch. Use it after you change the schema, fix a backfill bug, or alter the business logic so historical rows need recomputing. It&#39;s your reset button — and a reminder that incremental models trade away automatic recomputation of history. If you change how <code>order_total</code> is calculated, already-loaded rows keep the old value until you full-refresh.</p>
+<h2>Choosing a strategy</h2>
+<p><code>incremental_strategy</code> controls <em>what dbt does with the new rows once it has them</em>. There are four you&#39;ll actually use. They are not interchangeable — the difference is the guarantee you get, not the speed.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/dbt-incremental-d2.png" alt="The four incremental strategies differ in what they do to the target table once the new rows are staged. Pick by guarantee, not by habit.">
+<em>The four incremental strategies differ in what they do to the target table once the new rows are staged. Pick by guarantee, not by habit.</em></p>
+<p><strong><code>append</code></strong> — Insert the new rows. That&#39;s it. No matching, no dedup. It&#39;s the fastest and the most dangerous: re-run the same batch twice and you get duplicates. Use it only for genuinely append-only event streams where you control idempotency upstream, or where exact dedup happens in a downstream model. No <code>unique_key</code> needed.</p>
+<p><strong><code>merge</code></strong> — The default on BigQuery, Snowflake, and Databricks. Issues a SQL <code>MERGE</code>: for each staged row, if a row with the same <code>unique_key</code> exists, <strong>update</strong> it; otherwise <strong>insert</strong>. This makes re-running a batch idempotent — run it five times, same result. This is the right default for most fact and dimension tables.</p>
+<p><strong><code>delete+insert</code></strong> — <code>DELETE</code> the target rows whose <code>unique_key</code> matches the incoming batch, then <code>INSERT</code> the staged rows. Functionally similar idempotency to merge, but implemented as two statements. It&#39;s the go-to on adapters where <code>MERGE</code> is unsupported or slow — historically Redshift and Postgres lean on this.</p>
+<p><strong><code>insert_overwrite</code></strong> — The partition-aware one. Instead of matching individual keys, it <strong>replaces entire partitions</strong> that appear in the incoming data. Supported on BigQuery, Spark, and Databricks (among others). This is the strategy that makes time-partitioned tables genuinely cheap, and it deserves its own section below.</p>
+<p>A note on portability: not every strategy works on every warehouse. <code>merge</code>, <code>append</code>, and <code>delete+insert</code> are broadly supported; <code>insert_overwrite</code> does partition-replace on BigQuery/Spark/Databricks. Snowflake also accepts <code>insert_overwrite</code>, but it is <strong>not</strong> partition-aware there — it behaves like a truncate + re-insert of the whole table, so you don&#39;t get the cheap per-partition rewrite. Check your adapter&#39;s docs. Check the strategy support matrix in the dbt docs for your adapter before you commit to one.</p>
+<h3><code>unique_key</code>: the column that makes idempotency possible</h3>
+<p>For <code>merge</code> and <code>delete+insert</code>, <code>unique_key</code> is what dbt matches on. Two things will burn you:</p>
+<ol>
+<li><strong>Nulls.</strong> If a <code>unique_key</code> column contains nulls, the match silently fails and you get duplicates or unmatched rows. dbt&#39;s own docs flag this explicitly.</li>
+<li><strong>Strings vs. lists.</strong> Prefer a list of real columns over a concatenated string expression:</li>
+</ol>
+<pre><code class="language-sql">{{ config(
+    materialized=&#39;incremental&#39;,
+    unique_key=[&#39;order_id&#39;, &#39;line_item_id&#39;]
+) }}
+</code></pre>
+<p>A list builds a proper composite-key join condition. A hand-rolled <code>order_id || &#39;-&#39; || line_item_id</code> string is fragile and harder for the next person to read.</p>
+<h2>The <code>max(updated_at) from {{ this }}</code> pattern — and its two real bugs</h2>
+<p>The filter in the first example is the most common incremental pattern in the wild:</p>
+<pre><code class="language-sql">{% if is_incremental() %}
+  where updated_at &gt;= (select max(updated_at) from {{ this }})
+{% endif %}
+</code></pre>
+<p>It&#39;s clean and it usually works. But &quot;usually&quot; hides two failure modes that cause <strong>silent data loss</strong> — the worst kind, because dbt run stays green.</p>
+<h3>Bug 1: clock skew and the strict <code>&gt;</code></h3>
+<p>If you use strict <code>&gt;</code> (greater-than, not <code>&gt;=</code>), any rows whose <code>updated_at</code> exactly equals the previous max are <strong>never loaded</strong>. More subtly, if multiple source systems write <code>updated_at</code> from their own clocks, a row from a slightly-behind server can carry a timestamp <em>earlier</em> than a max you&#39;ve already recorded — and it falls outside your window forever.</p>
+<p>Two defenses:</p>
+<pre><code class="language-sql">{% if is_incremental() %}
+  where updated_at &gt;= (
+      select coalesce(max(updated_at), &#39;1900-01-01&#39;) from {{ this }}
+  )
+  -- overlap window: re-scan a safety margin to catch skew &amp; late arrivals
+  -- (the dedup step below makes the overlap safe)
+{% endif %}
+</code></pre>
+<p>Use <code>&gt;=</code>, not <code>&gt;</code>, and add a lookback buffer (re-pull the last few hours or a day). The buffer reprocesses some rows you already have — which is fine <em>only if your strategy is idempotent</em> (<code>merge</code> or <code>delete+insert</code> with a correct <code>unique_key</code>). With <code>append</code>, a lookback buffer manufactures duplicates. This is why strategy and filter design are coupled.</p>
+<h3>Bug 2: duplicates from the overlap</h3>
+<p>Once you add a lookback window, the same logical row can appear in both the existing table and the incoming batch. <code>merge</code>/<code>delete+insert</code> handle that by key. But if your source itself can emit the same <code>updated_at</code> key more than once in a batch, dedup <em>before</em> the merge:</p>
+<pre><code class="language-sql">with ranked as (
+    select
+        *,
+        row_number() over (
+            partition by order_id
+            order by updated_at desc, _loaded_at desc
+        ) as rn
+    from {{ ref(&#39;stg_orders&#39;) }}
+
+    {% if is_incremental() %}
+      where updated_at &gt;= (
+          select dateadd(&#39;day&#39;, -1, coalesce(max(updated_at), &#39;1900-01-01&#39;))
+          from {{ this }}
+      )
+    {% endif %}
+)
+
+select * exclude (rn)   -- Snowflake/DuckDB syntax; on BigQuery use SELECT * EXCEPT (rn); list columns elsewhere
+from ranked
+where rn = 1
+</code></pre>
+<p>The <code>row_number()</code> keeps the latest version of each key. This is the single most important habit in incremental modeling: <strong>a high-water-mark filter and a dedup step are a pair, not a choice.</strong></p>
+<p>This is also exactly the kind of invariant you want a test guarding. A <code>unique</code> test on <code>order_id</code> (or a <code>dbt_utils.unique_combination_of_columns</code> on a composite key) turns &quot;silent duplicate&quot; into &quot;loud red test.&quot; If you haven&#39;t set up testing on your incremental models, that&#39;s the natural next step — see my companion piece on <a href="dbt-tests">dbt tests</a> for the suite I run on every fact table.</p>
+<h2>Late-arriving data</h2>
+<p>&quot;Late-arriving&quot; means a row whose business event happened in the past but whose record showed up now — a backdated correction, a delayed webhook, an event buffered offline on a mobile device for three days.</p>
+<p>If you filter on the <em>event</em> timestamp (<code>event_time</code>), late arrivals fall behind your high-water mark and never load. The fixes:</p>
+<ul>
+<li><strong>Filter on a load/ingestion timestamp</strong> (<code>_loaded_at</code>, the time the row hit your warehouse) rather than the event time, when your goal is &quot;process everything new since last run.&quot;</li>
+<li>Or keep filtering on <code>event_time</code> but widen the lookback window to cover your realistic lateness (e.g. 3 days), and rely on idempotent <code>merge</code> to correct already-loaded rows.</li>
+</ul>
+<p>There&#39;s no free lunch: a wider window costs more compute per run. You&#39;re explicitly buying completeness with money. Pick the window from your data&#39;s actual lateness distribution, not a round number that feels safe.</p>
+<h2>Partitioned incrementals on BigQuery</h2>
+<p>This is where incremental models go from &quot;nice&quot; to &quot;10x cheaper,&quot; because BigQuery bills by bytes scanned. The trick is <code>insert_overwrite</code> with <code>partition_by</code> and dynamic partitions:</p>
+<pre><code class="language-sql">{{
+    config(
+        materialized=&#39;incremental&#39;,
+        incremental_strategy=&#39;insert_overwrite&#39;,
+        partition_by={
+            &#39;field&#39;: &#39;order_date&#39;,
+            &#39;data_type&#39;: &#39;date&#39;,
+            &#39;granularity&#39;: &#39;day&#39;
+        }
+    )
+}}
+
+select
+    order_id,
+    customer_id,
+    order_total,
+    cast(order_timestamp as date) as order_date
+from {{ ref(&#39;stg_orders&#39;) }}
+
+{% if is_incremental() %}
+  where cast(order_timestamp as date) in (
+      select distinct cast(order_timestamp as date)
+      from {{ ref(&#39;stg_orders&#39;) }}
+      where _loaded_at &gt;= timestamp_sub(current_timestamp(), interval 2 day)
+  )
+{% endif %}
+</code></pre>
+<p>What happens under the hood: dbt computes which partitions (here, which <code>order_date</code> values) appear in the incoming batch, then atomically <strong>replaces just those partitions</strong> in the target. A nightly run that touches three days of <code>order_date</code> rewrites three partitions and scans roughly three days of source — not the whole table.</p>
+<p>The partition math is the whole point. With daily partitions over two years (~730 partitions), reloading the latest day touches on the order of <code>1/730</code> of the table&#39;s storage and scan cost. That&#39;s the difference between a cents-per-run model and a dollars-per-run model, and it compounds every single night.</p>
+<p>Two gotchas specific to <code>insert_overwrite</code>:</p>
+<ul>
+<li><strong>No <code>unique_key</code> needed</strong> — the partition <em>is</em> the unit of idempotency. But that also means a partition you don&#39;t re-supply is left untouched, even if rows in it changed. Your filter must capture every partition that has new or changed data.</li>
+<li>If your incoming batch is missing a partition entirely (say, a day with zero orders that should have deleted yesterday&#39;s rows), <code>insert_overwrite</code> won&#39;t clear it. Partition-replace only overwrites partitions you hand it.</li>
+</ul>
+<h2>When NOT to use incremental models</h2>
+<p>Senior move: knowing when to skip the complexity.</p>
+<ul>
+<li><strong>Small tables.</strong> If a full rebuild runs in seconds, incremental logic is pure overhead and a maintenance liability. A <code>table</code> materialization is simpler and always correct.</li>
+<li><strong>Logic that frequently rewrites history.</strong> If your business rules routinely change values for old rows, you&#39;ll be running <code>--full-refresh</code> constantly — at which point incremental buys you nothing but bugs.</li>
+<li><strong>Heavy window functions across all history.</strong> If the model computes something like a running lifetime total per customer that depends on <em>all</em> prior rows, you can&#39;t just process &quot;new&quot; rows in isolation. These need careful design or a full rebuild.</li>
+<li><strong>You can&#39;t define a reliable high-water mark.</strong> No trustworthy <code>updated_at</code>, no reliable load timestamp, mutable rows with no version column? Incremental will silently drift. Fix the source contract first.</li>
+</ul>
+<p>Incremental models are a performance optimization, and like all optimizations they add complexity. Reach for them when a full refresh genuinely hurts — not by default.</p>
+<h2>Takeaways</h2>
+<ul>
+<li><strong><code>is_incremental()</code> is true only when</strong> the model is incremental, the table already exists, and <code>--full-refresh</code> wasn&#39;t passed. Your SQL must compile in both branches.</li>
+<li><strong>Match the strategy to the guarantee:</strong> <code>append</code> (fast, dangerous, no dedup), <code>merge</code> (idempotent upsert, the sane default on BigQuery/Snowflake/Databricks), <code>delete+insert</code> (idempotent where merge is weak), <code>insert_overwrite</code> (partition-replace, cheapest for time-partitioned tables).</li>
+<li><strong>The high-water mark and a dedup step are a pair.</strong> Use <code>&gt;=</code> not <code>&gt;</code>, add a lookback buffer, and <code>row_number()</code> to keep the latest row per <code>unique_key</code>.</li>
+<li><strong><code>unique_key</code> must be non-null.</strong> Nulls silently break matching and create duplicates. Use a list of columns for composite keys.</li>
+<li><strong>For late-arriving data,</strong> filter on load time or widen the lookback window — and only do this with an idempotent strategy.</li>
+<li><strong>On BigQuery, <code>insert_overwrite</code> + <code>partition_by</code></strong> turns a full-table scan into a few-partition scan. Make sure your filter supplies every changed partition.</li>
+<li><strong>Guard all of it with tests</strong> — a <code>unique</code> test is what turns &quot;silent data loss&quot; into a failing CI run.</li>
+</ul>
+<p>If you build incremental models without tests on the unique key, you&#39;re flying blind — that&#39;s the companion read: <a href="dbt-tests">dbt tests that catch real bugs</a>.</p>
+<p>Have a war story where a <code>max(updated_at)</code> filter dropped rows on you? I&#39;d genuinely like to hear how you found it — drop it in the responses. And if this saved you a 3 a.m. full-refresh, follow for more dbt and analytics-engineering field notes.</p>

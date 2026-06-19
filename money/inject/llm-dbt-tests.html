@@ -1,0 +1,140 @@
+<p><em>A human-in-the-loop workflow for generating not_null, unique, accepted_values, and relationships tests from schema and profiling stats — and the three failure modes that will burn you if you trust the output blind.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/cover-llm-dbt-tests.png" alt="I Let an LLM Write My dbt Tests: What Worked and What Quietly Broke">
+You inherit a 40-model dbt project. The previous analytics engineer left, and your <code>dbt test</code> suite has exactly nine tests in it — eight <code>not_null</code>s and one <code>unique</code> on a primary key someone added during an incident. Meanwhile a finance dashboard quietly served duplicated revenue for three weeks because nobody asserted that <code>order_id</code> was unique in the staging model.</p>
+<p>Writing tests for 40 models by hand is the kind of work that is simultaneously urgent and the first thing you deprioritize. It is repetitive, it is boring, and the boilerplate-to-insight ratio is brutal. So I did what a lot of us are quietly doing now: I fed the schema and some profiling stats to an LLM and asked it to propose the tests.</p>
+<p>It went better than I expected in some places and worse in ways that would have shipped silent bugs if I had trusted it. This is the workflow I landed on, the parts I now let the model own, and the three failure modes that will bite you if you paste its output without reading it.</p>
+<p>If you want a refresher on the test types themselves before going further, see the companion piece on <a href="dbt-tests">dbt tests</a>. This article assumes you know what <code>not_null</code> does and focuses on the <em>generation</em> problem.</p>
+<h2>The input matters more than the prompt</h2>
+<p>The single biggest lever is not prompt wording — it is what you put in the context window. An LLM handed only column names will guess from the names. That guessing is exactly where hallucinated tests come from. Handed actual profiling statistics, it stops guessing and starts describing the data you already have.</p>
+<p>So before prompting, profile the model. You do not need a fancy tool; a SQL query gets you most of the way. Here is a profiling query you can run against any warehouse table (this is standard ANSI SQL):</p>
+<pre><code class="language-sql">-- Profile one column set for an LLM prompt.
+-- Run per model; paste the result into the context.
+select
+    count(*)                                   as row_count,
+    count(distinct order_id)                   as distinct_order_id,
+    sum(case when order_id is null then 1 else 0 end) as null_order_id,
+    count(distinct status)                     as distinct_status,
+    min(order_total)                           as min_total,
+    max(order_total)                           as max_total,
+    sum(case when order_total &lt; 0 then 1 else 0 end)  as negative_totals
+from analytics.stg_orders;
+</code></pre>
+<p>And critically, for low-cardinality columns, hand the model the <em>observed domain</em>:</p>
+<pre><code class="language-sql">select status, count(*) as n
+from analytics.stg_orders
+group by 1
+order by 2 desc;
+-- e.g. completed: 81204, pending: 4410, cancelled: 2087, refunded: 311
+</code></pre>
+<p>That <code>group by</code> result is the highest-value thing you can give an LLM. It is the difference between the model inventing accepted values and the model reporting the ones that actually exist.</p>
+<h2>A workflow that survives contact with reality</h2>
+<p>The mistake is treating this as &quot;LLM writes tests, I commit them.&quot; The workflow that actually held up treats the LLM as a fast junior who drafts, and treats <em>you</em> as the reviewer who classifies every line by how much trust it deserves.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/llm-dbt-tests-d1.png" alt="The human-in-the-loop pipeline: profiling stats and schema go in, the LLM drafts tests, and every test passes through a review gate sorted by trust tier before it reaches schema.yml.">
+<em>The human-in-the-loop pipeline: profiling stats and schema go in, the LLM drafts tests, and every test passes through a review gate sorted by trust tier before it reaches schema.yml.</em></p>
+<p>The prompt I settled on is boring on purpose. Boring prompts produce auditable output:</p>
+<pre><code class="language-text">You are drafting dbt v1.x generic tests for one model.
+
+Here is the model&#39;s column schema (name, type):
+&lt;paste schema&gt;
+
+Here are profiling stats for the table:
+&lt;paste row_count, distinct counts, null counts, min/max, negative counts&gt;
+
+Here are the full observed value domains for low-cardinality columns:
+&lt;paste the group-by results&gt;
+
+Rules:
+- Only propose not_null where the null count is 0.
+- Only propose unique where distinct count == row count.
+- For accepted_values, use ONLY the values present in the observed domain
+  I gave you. Do not add values you think *might* appear.
+- Propose relationships tests ONLY as commented-out suggestions, and for
+  each one state which two columns you are linking and why.
+- For any business rule you cannot verify from the stats, emit it as a
+  commented TODO, not an active test.
+- Output valid schema.yml. After each test add a one-line `# rationale:`
+  comment explaining which stat justifies it.
+</code></pre>
+<p>That last rule — a rationale per test — is what makes the review fast. You are not re-deriving the model&#39;s reasoning; you are checking it against the stat it cites.</p>
+<h2>The output, and how to read it</h2>
+<p>Here is a representative chunk of what comes back, lightly cleaned. Note the <code>data_tests:</code> key — dbt renamed <code>tests:</code> to <code>data_tests:</code> in v1.8, though <code>tests:</code> still works for backward compatibility:</p>
+<pre><code class="language-yaml">version: 2
+
+models:
+  - name: stg_orders
+    columns:
+      - name: order_id
+        data_tests:
+          - not_null      # rationale: null_order_id = 0
+          - unique        # rationale: distinct_order_id == row_count
+
+      - name: status
+        data_tests:
+          - accepted_values:
+              values: [&#39;completed&#39;, &#39;pending&#39;, &#39;cancelled&#39;, &#39;refunded&#39;]
+          # rationale: full observed domain, 4 distinct values
+
+      - name: order_total
+        data_tests:
+          - not_null      # rationale: 0 nulls observed
+          # TODO(human): negative_totals = 0 today, but is a negative
+          # order_total ever valid (refunds)? business rule — verify.
+
+      # SUGGESTION (commented, verify before enabling):
+      # - name: customer_id
+      #   data_tests:
+      #     - relationships:
+      #         to: ref(&#39;stg_customers&#39;)
+      #         field: customer_id
+      #   # rationale: name match only — I cannot confirm this FK from stats
+</code></pre>
+<p>Read that <code>customer_id</code> suggestion carefully, because it is the whole point of the article. The model linked <code>stg_orders.customer_id</code> to <code>stg_customers.customer_id</code> on the strength of the <em>name</em>. It has no idea whether your customers table is filtered to active customers, whether guest checkouts produce a <code>customer_id</code> that doesn&#39;t exist there, or whether the real key is <code>account_id</code>. Enable that test blind and your next run fails loudly — or worse, passes because the data happens to align today and breaks in three months when guest checkout ships.</p>
+<h2>Where it shines and where it bites</h2>
+<p>After running this across a real project, the tests sorted cleanly into trust tiers.</p>
+<p><strong>Where the LLM genuinely earns its keep:</strong></p>
+<ul>
+<li><strong><code>not_null</code> and <code>unique</code> boilerplate.</strong> Tedious, mechanical, and fully verifiable from the stats. This is 60–70% of a typical suite in my experience and the model nails it when you gate on the null/distinct counts.</li>
+<li><strong><code>accepted_values</code> from an observed domain.</strong> When you hand it the <code>group by</code> result, it transcribes the domain accurately. This is a genuinely nice win — building these by hand means eyeballing a <code>select distinct</code> anyway, and the model does the YAML formatting for free.</li>
+<li><strong>Surfacing candidates you forgot.</strong> It reliably flags &quot;you have a <code>created_at</code> with no freshness or recency check&quot; — useful prompts even when the exact test is wrong.</li>
+</ul>
+<p><strong>Where it is actively dangerous:</strong></p>
+<ul>
+<li><strong>Hallucinated <code>relationships</code> tests.</strong> The model cannot know your foreign keys. It pattern-matches on column names and produces confident, plausible, wrong links. This is the number-one thing to never auto-accept.</li>
+<li><strong>False confidence on thresholds.</strong> Ask for a range test and it will happily assert <code>order_total between 0 and 10000</code> — a bound it invented. The <code>10000</code> is fiction. It looks authoritative precisely because it is specific.</li>
+<li><strong>Business rules it cannot see.</strong> &quot;A <code>refunded</code> order must have a non-null <code>refund_date</code>,&quot; &quot;a subscription cannot have <code>end_date &lt; start_date</code>.&quot; These live in your domain knowledge and your stakeholders&#39; heads, not in column statistics. The model will sometimes guess them, and a lucky guess is more dangerous than an obvious miss because it teaches you to trust the next one.</li>
+</ul>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/money/images/llm-dbt-tests-d2.png" alt="Where LLM-generated dbt tests land on a trust-vs-effort grid — the cheap wins are real, the dangerous ones look just as confident.">
+<em>Where LLM-generated dbt tests land on a trust-vs-effort grid — the cheap wins are real, the dangerous ones look just as confident.</em></p>
+<p>The pattern underneath all three failures is the same: <strong>the LLM cannot distinguish a fact about your data from a property of your business.</strong> Statistics describe what <em>is</em>. Tests should encode what <em>must be true</em>. Those overlap, but they are not the same set, and the gap between them is exactly where you have to do the thinking.</p>
+<h2>Singular tests: draft, then verify the SQL</h2>
+<p>For logic that doesn&#39;t fit a generic test, the model writes a decent first draft of a singular test — a SQL file in <code>tests/</code> that should return zero rows. Here it is a real time-saver because the boilerplate (the <code>select</code> that finds violations) is fiddly to get right:</p>
+<pre><code class="language-sql">-- tests/assert_refunded_orders_have_refund_date.sql
+-- LLM draft, human-verified: confirmed with finance that this rule holds.
+select
+    order_id
+from {{ ref(&#39;stg_orders&#39;) }}
+where status = &#39;refunded&#39;
+  and refund_date is null
+</code></pre>
+<p>The model got the shape right. What it could <em>not</em> do was tell me whether the rule is true — I had to ask finance. The division of labor is clean: the LLM writes the SQL, you supply the truth. Run it the normal way:</p>
+<pre><code class="language-bash">dbt test --select stg_orders
+dbt test --select assert_refunded_orders_have_refund_date
+</code></pre>
+<h2>When not to bother</h2>
+<p>This workflow is not free, and there are cases where I skip it:</p>
+<ul>
+<li><strong>A handful of models.</strong> If you have five models, the profiling-and-reviewing overhead costs more than just writing the tests. The LLM wins at <em>volume</em>.</li>
+<li><strong>Highly regulated or business-critical logic.</strong> If a wrong test creates false confidence in a financial close or a compliance report, the asymmetry is brutal — write those by hand with the stakeholder in the room.</li>
+<li><strong>No profiling stats available.</strong> Without the data, you are back to name-based guessing and every failure mode above gets worse. If you can&#39;t profile, don&#39;t generate.</li>
+</ul>
+<h2>Takeaways</h2>
+<ul>
+<li><strong>Feed stats, not just names.</strong> The <code>group by</code> and null/distinct counts are what separate description from hallucination. The prompt matters less than the context.</li>
+<li><strong>Auto-accept only what the stats prove:</strong> <code>not_null</code>, <code>unique</code>, and <code>accepted_values</code> drawn from the full observed domain.</li>
+<li><strong>Never auto-accept <code>relationships</code> tests or invented thresholds.</strong> Treat them as commented suggestions until a human confirms the key and the bound.</li>
+<li><strong>Make the model show its work.</strong> A <code># rationale:</code> per test turns review from re-derivation into a quick check against a cited stat.</li>
+<li><strong>The LLM writes SQL; you supply the truth.</strong> Singular tests for business rules are a draft-plus-verify task, never a generate-and-commit one.</li>
+<li><strong>Use it for volume, skip it for small or high-stakes suites.</strong> The economics only work when there&#39;s real boilerplate to absorb.</li>
+</ul>
+<p>I treat the LLM as a fast, tireless junior who has never met my stakeholders: great at the mechanical 70%, untrustworthy on the 30% that requires knowing the business. Gate accordingly and it genuinely speeds you up.</p>
+<p>If you want the test-type fundamentals this builds on, read the companion piece on <a href="dbt-tests">dbt tests</a>. And if you try this workflow — what&#39;s the weirdest test your LLM tried to sneak past you? I collect them. Follow along and drop yours in the responses.</p>
