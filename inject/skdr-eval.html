@@ -1,0 +1,118 @@
+<p><em>skdr-eval estimates how your candidate sklearn policy would have performed on logged decisions — and tells you, with PSIS Pareto-k and ESS, when the logs can&#39;t support that answer.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-skdr-eval.png" alt="Offline Policy Evaluation in Python: Trust a Model Before You Ship It">
+You trained a better recommender. Or a smarter router, a new treatment rule, a sharper ad-targeting policy. Offline metrics on a holdout look great. Now comes the uncomfortable part: do you ship it to live traffic?</p>
+<p>A/B tests are the honest answer, but they cost real money — lost revenue, SLA violations, patient risk, operator overtime. So you want a cheaper read first: <em>given the decisions we already logged, how would this new policy have performed?</em> That question has a name — <strong>off-policy evaluation (OPE)</strong> — and a well-known trap. Naive importance weighting will happily hand you a confident-looking number even when your logs contain almost no evidence about what the new policy would do.</p>
+<p><a href="https://github.com/dgenio/skdr-eval"><code>skdr-eval</code></a> is a small, MIT-licensed Python library built around that exact failure mode. It estimates a candidate policy&#39;s value from logged <code>(context, action, reward)</code> decisions using <strong>Doubly Robust (DR)</strong> and <strong>Stabilized DR (SNDR)</strong> estimators on top of any scikit-learn-compatible model — and just as importantly, it ships a battery of <strong>trust diagnostics</strong> that tell you when the estimate is not worth acting on.</p>
+<p>This is a deep-dive: we&#39;ll go through the mechanism, the diagnostics, the deploy verdict logic, and the simulation evidence that the estimators actually recover known ground truth. Everything below is taken from the repo at version <code>0.11.0</code>.</p>
+<h2>The problem, concretely</h2>
+<p>You have a table of logged decisions. Each row is a context (features), the action the <em>old</em> policy took, the reward it got, and a timestamp:</p>
+<pre><code class="language-text">context (x)        action (a)     reward (y)    time
+[0.3, 1, 0.8]      operator_3     12.4s         2024-01-01 09:00
+[0.9, 0, 0.2]      operator_1      6.1s         2024-01-01 09:05
+...
+</code></pre>
+<p>You also have a candidate policy <code>π</code> — a model that, given the same context, would pick actions differently. The thing you want is <code>V(π)</code>: the average reward you&#39;d expect if <code>π</code> had been making the decisions instead.</p>
+<p>The naive estimator is inverse propensity weighting (IPS): reweight each logged reward by how much more (or less) likely <code>π</code> was to take the logged action versus the old policy. The problem is variance. If <code>π</code> wants to take actions the old policy almost never took, a handful of rows get enormous weights, and your estimate becomes a noisy average of a few lucky samples. Worse, nothing in the raw IPS number warns you this happened.</p>
+<h2>The idea in one paragraph</h2>
+<p>Doubly Robust estimation combines two models — an <strong>outcome model</strong> <code>q̂(x, a)</code> that predicts reward, and a <strong>propensity model</strong> <code>e(a|x)</code> that predicts what the logging policy did — so the estimate is unbiased if <em>either</em> one is correctly specified. SNDR additionally normalizes the importance weights to cut variance. On top of the point estimate, <code>skdr-eval</code> computes diagnostics that quantify whether the logs actually overlap with what the candidate would do: effective sample size, match rate, <strong>PSIS Pareto-k</strong> on the importance-weight tail, propensity calibration error, and clip-grid sensitivity. Then it rolls those into a single <code>support_health</code> label — <code>ok</code>, <code>caution</code>, or <code>high_risk</code> — and a <code>deploy</code> / <code>ab_test</code> / <code>do_not_deploy</code> verdict.</p>
+<h2>How it actually works</h2>
+<p>The two estimators are exactly the textbook DR / SNDR forms. DR:</p>
+<pre><code class="language-text">V̂_DR = (1/n) Σ [ q̂_π(x_i) + w_i · (y_i − q̂(x_i, a_i)) ]
+</code></pre>
+<p>SNDR self-normalizes the correction term:</p>
+<pre><code class="language-text">V̂_SNDR = (1/n) Σ q̂_π(x_i) + [ Σ w_i·(y_i − q̂(x_i,a_i)) ] / [ Σ w_i ]
+</code></pre>
+<p>where <code>q̂_π(x)</code> is the predicted reward under the candidate policy, <code>q̂(x,a)</code> is the outcome model, and <code>w_i = π(a_i|x_i) / e(a_i|x_i)</code> is the (clipped) importance weight with <code>e</code> a <em>calibrated</em> propensity score.</p>
+<p>Two implementation choices matter for real logs:</p>
+<ul>
+<li><strong>Time-aware everything.</strong> Logged decisions are correlated in time, so every cross-validation step uses <code>TimeSeriesSplit</code> with temporal ordering, propensities are calibrated per-fold with isotonic <code>CalibratedClassifierCV</code>, and confidence intervals come from a <strong>moving-block bootstrap</strong> that preserves short-range dependence. There&#39;s even an explicit <code>gap</code> parameter (default <code>1</code>) that drops adjacent rows between train and test folds to guard against leakage.</li>
+<li><strong>Clipping is a grid, not a guess.</strong> Instead of hard-coding one importance-weight cap, the evaluator sweeps a <code>clip_grid</code> (default <code>(2, 5, 10, 20, 50, ∞)</code>), picks a threshold that keeps effective sample size healthy, and reports how much the estimate <em>moved</em> across the grid as a sensitivity signal. If your number swings wildly depending on where you clip, that&#39;s information you want.</li>
+</ul>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/skdr-d1.png" alt="From logged decisions to a deploy verdict: skdr-eval estimates a candidate policy&#39;s value, then gates it on trust diagnostics before you act.">
+<em>From logged decisions to a deploy verdict: skdr-eval estimates a candidate policy&#39;s value, then gates it on trust diagnostics before you act.</em></p>
+<p>The whole run returns a single <code>EvaluationArtifact</code> bundling the report DataFrame, per-model results, warnings, sensitivity, propensity diagnostics, and exporters for an HTML report and a machine-readable card.</p>
+<h2>The part most OPE tutorials skip: the trust diagnostics</h2>
+<p>This is the reason to reach for <code>skdr-eval</code> over rolling your own DR. The <code>support_health</code> label is computed from thresholds that are grounded in published guidance, not vibes (the defaults live in <code>SupportHealthThresholds</code>):</p>
+<pre><code class="language-text">Diagnostic                          Caution threshold   Escalates to `high_risk`        Source cited in code
+---------------------------------   -----------------   -----------------------------   ---------------------
+Effective sample size (`ESS / n`)   below 10%           below 5%                        Owen (2013), §9.4
+Clip tail mass                      above 5%            above 10%                       Kang &amp; Schafer (2007)
+Match rate                          below 50%           below 25%                       —
+PSIS Pareto-k                       0.5 ≤ k &lt; 0.7       k ≥ 0.7                         Vehtari et al. (2024)
+Propensity ECE                      above 0.10          above 0.20                      Guo et al. (2017)
+Min propensity                      —                   at/below `1/n` (zero overlap)   —
+</code></pre>
+<p>Two or more caution-level flags also escalate to <code>high_risk</code>. The Pareto-k diagnostic is the sharpest of the bunch: it fits a Generalized Pareto Distribution to the tail of the raw importance weights, and the shape parameter <code>k</code> directly indicates whether the estimator&#39;s variance even exists. At <code>k ≥ 0.7</code> the variance is undefined and your estimate is being driven by a few decisions — exactly the failure mode the naive IPS number hides.</p>
+<p>Those flags then drive a verdict. From the report&#39;s recommendation logic: any <code>high_risk</code> blocker yields <code>do_not_deploy</code> with high confidence. If bootstrap CIs are on and the lower bound beats the logged baseline cleanly, you get <code>deploy</code>; if it beats the baseline but caution flags are present, you get <code>ab_test</code> (i.e., the offline read is promising but go validate it live). The verdict is meant to gate a CI pipeline, which is why the CLI returns exit code <code>3</code> when any model row&#39;s verdict is <code>do_not_deploy</code>.</p>
+<h2>Try it in 5 minutes</h2>
+<p>Install from PyPI — the core has no exotic dependencies (numpy, pandas, pyyaml, scikit-learn, scipy, jinja2, pydantic):</p>
+<pre><code class="language-bash">pip install skdr-eval
+</code></pre>
+<p>Here&#39;s a complete, runnable evaluation adapted from <code>examples/quickstart.py</code>. It generates synthetic logs, evaluates two sklearn models, and reads back the estimate <em>and</em> the trust signals:</p>
+<pre><code class="language-python">import skdr_eval
+from sklearn.ensemble import RandomForestRegressor, HistGradientBoostingRegressor
+
+# 1. Logged decisions (here, synthetic service-time logs)
+logs, ops_all, _ = skdr_eval.make_synth_logs(n=5000, n_ops=5, seed=42)
+
+# 2. Candidate policies — anything with fit/predict
+models = {
+    &quot;RandomForest&quot;: RandomForestRegressor(n_estimators=100, random_state=42),
+    &quot;HistGradientBoosting&quot;: HistGradientBoostingRegressor(random_state=42),
+}
+
+# 3. Evaluate with DR and SNDR
+artifact = skdr_eval.evaluate_sklearn_models(
+    logs=logs,
+    models=models,
+    fit_models=True,
+    n_splits=3,
+    random_state=42,
+    policy_train=&quot;pre_split&quot;,   # fit the policy on a holdout slice, evaluate on the tail
+)
+
+# 4. The estimate ...
+print(artifact.report[[&quot;model&quot;, &quot;estimator&quot;, &quot;V_hat&quot;, &quot;ESS&quot;, &quot;match_rate&quot;]])
+
+# 5. ... and whether you should believe it
+print(artifact.warnings)      # per-(model, estimator) support_health + codes
+print(artifact.sensitivity)   # clip-grid value range + stability flag
+print(artifact.diagnostics)   # propensity overlap / calibration
+
+# 6. Stakeholder artifacts
+artifact.export(&quot;artifacts/run&quot;, formats=[&quot;json&quot;, &quot;html&quot;])
+artifact.save_card(&quot;artifacts/run_card.html&quot;, &quot;RandomForest&quot;)
+</code></pre>
+<p>If your reward column isn&#39;t called <code>service_time</code> (the original use case was call-routing), pass <code>y_col=&quot;reward&quot;</code> — or <code>y_col=&quot;click&quot;</code>, <code>y_col=&quot;revenue&quot;</code>, whatever your logs use.</p>
+<p>You don&#39;t even need a tabular pipeline. If you have logged <strong>agent routing or LLM-reranker decisions</strong> as JSONL traces, the trace adapter maps generic <code>(context, action, reward)</code> records into a valid logs frame:</p>
+<pre><code class="language-python">adapted = skdr_eval.adapters.from_jsonl_trace(&quot;agent_traces.jsonl&quot;, reward_col=&quot;cost&quot;)
+artifact = skdr_eval.evaluate_sklearn_models(
+    logs=adapted.logs, models={&quot;candidate&quot;: my_cost_model}, y_col=adapted.reward_col,
+)
+print(artifact.report[[&quot;model&quot;, &quot;estimator&quot;, &quot;V_hat&quot;, &quot;support_health&quot;]])
+</code></pre>
+<p>There&#39;s also a CLI behind the <code>[cli]</code> extra (<code>skdr-eval doctor logs.parquet</code>, <code>skdr-eval evaluate ... --out ./run</code>) with the stable exit codes mentioned above, so you can wire offline evaluation straight into a deploy gate.</p>
+<h2>Does it actually recover the truth? The benchmark angle</h2>
+<p>A point estimator is only worth trusting if it provably recovers a known value on data where you control the answer. <code>skdr-eval</code> treats this as a hard project rule: any change to the statistical core must ship a simulation that recovers a ground-truth parameter. Those simulations live in <code>tests/sim_studies/</code> and are part of the suite.</p>
+<p>The recovery tests construct a synthetic world with an analytic policy value <code>V*</code>, then assert the estimator lands within a few standard errors of it. From <code>test_estimator_recovery_simulation.py</code>, DR, MRDR, and SWITCH-DR each recover <code>V*</code> within <strong>3 standard errors</strong> of their influence-function CI; DRos within 4. The MIPS (marginalized IPS) estimator recovers <code>V*</code> within 3 SE when the action embedding is sufficient. The LLM-reranker recipe recovers a known target value within <strong>±2 SE</strong> using embedding-MIPS, CPU-only, with no runtime LLM dependency. And the failure-mode demos in <code>examples/known_failures/</code> go the other way on purpose: a near-argmax logging policy with poor overlap correctly produces <code>support_health = high_risk</code>, <code>HIGH_PARETO_K</code>, and a large Pareto-k rather than a confident lie.</p>
+<p>On maturity, be clear-eyed: the package is <strong>Beta</strong> (<code>Development Status :: 4 - Beta</code>) at version <code>0.11.0</code>. It is, however, seriously tested — <strong>880 test functions across 55 test files (47 in the main suite plus 8 simulation studies in tests/sim_studies/)</strong>, plus the simulation studies above, with CI running the quickstart, every notebook, and every use-case script on each PR so the examples can&#39;t silently rot.</p>
+<h2>Honest limitations</h2>
+<p>OPE is not magic, and <code>skdr-eval</code> is unusually upfront about it:</p>
+<ul>
+<li><strong>It&#39;s contextual-bandit OPE, not RL.</strong> One-shot logged decisions only. If your problem has state transitions and long horizons, reach for SCOPE-RL or d3rlpy — the docs say so directly.</li>
+<li><strong>It needs overlap.</strong> If your logs have no support for what the candidate would do, <em>no</em> estimator can fix that. <code>skdr-eval</code>&#39;s contribution is that it returns <code>high_risk</code> instead of a confident number.</li>
+<li><strong>The estimate is an estimate, not a guarantee.</strong> It holds under the standard OPE assumptions (unconfoundedness, overlap, a stable data-generating process, useful nuisance models). The diagnostics are <em>trust signals</em>, not proofs of correctness, and offline evaluation does not replace online validation.</li>
+<li><strong>Slate/top-K and very large action spaces are partial.</strong> A <code>slate</code> subpackage and MIPS exist, but full slate estimators and MIPS for huge action spaces are still maturing.</li>
+</ul>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/skdr-d2.png" alt="Same problem, two logging regimes. Healthy exploration yields support_health = ok; near-deterministic logging collapses overlap and yields high_risk — no estimator can rescue it.">
+<em>Same problem, two logging regimes. Healthy exploration yields support_health = ok; near-deterministic logging collapses overlap and yields high_risk — no estimator can rescue it.</em></p>
+<h2>Takeaways</h2>
+<ul>
+<li>Offline policy evaluation lets you score a candidate policy from logged <code>(context, action, reward)</code> data <em>before</em> you spend an A/B test on it.</li>
+<li>DR/SNDR are doubly robust — unbiased if either the outcome model or the propensity model is right — and <code>skdr-eval</code> wraps them around any <code>fit</code>/<code>predict</code> sklearn model.</li>
+<li>The differentiator is the <strong>trust layer</strong>: ESS, match rate, PSIS Pareto-k, calibration ECE, and clip-grid sensitivity roll up into a <code>support_health</code> label and a <code>deploy</code> / <code>ab_test</code> / <code>do_not_deploy</code> verdict you can gate CI on.</li>
+<li>The estimators are validated by simulation studies that recover known ground truth within a few standard errors, and the failure-mode demos prove the diagnostics fire when they should.</li>
+<li>It&#39;s Beta at <code>0.11.0</code>, MIT-licensed, time-series-aware, and works on tabular logs, agent traces, and LLM-reranker logs alike.</li>
+</ul>
+<p>If you&#39;re shipping anything that makes a decision — a recommender, a router, a targeting rule, an agent&#39;s tool selection — <code>skdr-eval</code> is a cheap, honest first read on whether your next version is actually better. It also pairs naturally with agent stacks like <strong>agent-kernel</strong>, <strong>ChainWeaver</strong>, and <strong>contextweaver</strong>, which emit exactly the logged decisions it consumes.</p>
+<p>Star it, try the quickstart, and run <code>skdr-eval doctor</code> on your own logs: <strong><a href="https://github.com/dgenio/skdr-eval">github.com/dgenio/skdr-eval</a></strong>.</p>
