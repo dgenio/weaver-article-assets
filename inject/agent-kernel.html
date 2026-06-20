@@ -1,5 +1,6 @@
 <p><em>Your agent has 1,000 tools and no idea which ones it&#39;s allowed to call. agent-kernel gives every tool call an HMAC capability token, a policy gate, and a tamper-evident audit trail — in-process, in two dependencies.</em></p>
-<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-agent-kernel.png" alt="Capability Tokens for AI Agents: A Security Kernel in Python">
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/images/cover-agent-kernel.png" alt="Capability Tokens for AI Agents: A Security Kernel in Python"></p>
+<p><strong>agent-kernel (PyPI: <code>weaver-kernel</code>) is an in-process Python security library that sits between your LLM loop and your tools and enforces one rule: no token, no execution. Every tool call must present an HMAC-SHA256 capability token bound to a single principal and capability, passes a deterministic policy engine, runs through a context firewall that redacts and bounds output before the model sees it, and is written to a hash-chained, tamper-evident audit log. It runs in two dependencies (<code>httpx</code>, <code>pydantic</code>), ships 665 tests with strict <code>mypy</code>, and is honest alpha software (currently 0.11.0).</strong>
 Your agent works. You wired up an LLM, handed it a pile of MCP tools, and watched it plan, call <code>list_invoices</code>, summarize the result. Demo-day magic.</p>
 <p>Then you tried to ship it, and the questions started:</p>
 <ul>
@@ -178,3 +179,14 @@ asyncio.run(main())
 </ul>
 <p>If you&#39;re building agents that touch anything that matters — money, customer data, destructive operations — the authorization-and-audit layer is not optional, and you probably shouldn&#39;t hand-roll it. <code>agent-kernel</code> is a small, well-tested, brutally honest starting point.</p>
 <p><strong>Star and try the repo: <a href="https://github.com/dgenio/agent-kernel">github.com/dgenio/agent-kernel</a>.</strong> <code>pip install weaver-kernel</code>, run the quickstart, and file an issue when you hit a sharp edge — alpha projects improve fastest when real users push on them.</p>
+<h2>FAQ</h2>
+<p><strong>What is agent-kernel and what problem does it solve?</strong>
+agent-kernel is a small Python library that adds least-privilege authorization and a tamper-evident audit trail to AI agents. It closes the gap in most agent frameworks where any tool the model can name it can call, raw tool output flows straight back into the prompt, and there&#39;s no verifiable record of what ran.</p>
+<p><strong>What is the package name — agent-kernel or weaver-kernel?</strong>
+The GitHub repo is <code>dgenio/agent-kernel</code>, the PyPI package is <code>weaver-kernel</code> (<code>pip install weaver-kernel</code>), and the Python import is <code>weaver_kernel</code>. The old <code>agent_kernel</code> import was renamed to <code>weaver_kernel</code> in version 0.10.0 and no longer exists.</p>
+<p><strong>How do capability tokens stop confused-deputy attacks?</strong>
+Each token is an HMAC-SHA256-signed, time-bounded credential bound to exactly one principal and one capability. On verification the kernel checks revocation, expiry, a constant-time signature comparison, then principal and capability binding — so if agent A hands its token to agent B, B&#39;s principal won&#39;t match and the call is rejected. A token is not a bearer credential.</p>
+<p><strong>What does the context firewall do?</strong>
+The firewall (weaver-spec invariant I-01) ensures the LLM never sees raw driver output by default. It transforms raw results into a bounded <code>Frame</code> with compact facts and an expandable handle, enforces an <code>allowed_fields</code> whitelist, and applies regex redaction for emails, phone numbers, card/SSN patterns, Bearer tokens, JWTs, API keys, and connection strings — failing closed past the depth limit.</p>
+<p><strong>What are agent-kernel&#39;s main limitations?</strong>
+It&#39;s alpha software (v0.11.0) and not production-hardened for real authentication. HMAC tokens are signed but not encrypted, PII redaction is heuristic regex (not data governance), audit truncation and whole-log deletion aren&#39;t yet detectable (no signed head anchor), and rate-limit state is in-process only — it resets on restart and isn&#39;t distributed.</p>
