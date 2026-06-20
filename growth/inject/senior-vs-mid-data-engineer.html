@@ -1,0 +1,117 @@
+<p><em>It isn&#39;t the tools, the SQL, or the years. It&#39;s idempotency, cost-awareness, blast radius, and knowing when not to build.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/cover-senior-vs-mid-data-engineer.png" alt="Senior vs. Mid-Level Data Engineer: What Actually Separates Them">
+<strong>The gap between a mid-level and a senior data engineer is not SQL skill, tool knowledge, or years served. It&#39;s that a senior optimizes for the whole system over time, while a mid-level engineer optimizes for correct output today.</strong> A mid-level engineer asks, &quot;Does this pipeline produce the right numbers?&quot; A senior asks five harder questions before shipping: Can I safely rerun this? What does it cost? Who downstream breaks if the schema changes? How will I find out when it fails at 3am? And the most senior question of all — should this thing exist at all? The difference is almost entirely about how you reason under failure, cost, and time, not about what you can build on a good day.</p>
+<p>I&#39;ve sat on both sides of this. I&#39;ve been the mid-level engineer proud of a pipeline that ran green for a week, and I&#39;ve been the senior who got paged because that same pipeline silently double-counted revenue after a retry. The skills below are the ones I actually watch for when deciding whether someone is operating at a senior level — and none of them show up on a résumé.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/senior-vs-mid-data-engineer-d1.png" alt="The widening gap: mid-level engineers optimize for &#39;does it produce the right output today?&#39; while seniors optimize for &#39;what happens to everything downstream when this breaks at 3am?&#39;">
+<em>The widening gap: mid-level engineers optimize for &#39;does it produce the right output today?&#39; while seniors optimize for &#39;what happens to everything downstream when this breaks at 3am?&#39;</em></p>
+<h2>The short version: a mid vs. senior comparison table</h2>
+<p>If you read nothing else, read this. Each row is a real situation, not an abstract competency.</p>
+<pre><code class="language-text">Situation                                    Mid-level engineer                                   Senior engineer
+------------------------------------------   --------------------------------------------------   ------------------------------------------------------------------------------------------------
+**A job fails halfway through**              Reruns it and hopes; manually cleans up duplicates   Designed it to be idempotent, so a rerun is a no-op risk; cleanup is automatic
+**Backfilling 2 years of history**           Writes a one-off script, runs it once, deletes it    Makes the backfill a parameterized, partition-safe path that is the *same code* as the daily run
+**Query cost**                               Doesn&#39;t look until Finance asks                      Knows the cost model, partitions/clusters, and prunes scanned bytes before merging
+**A stakeholder asks for a new dashboard**   Builds it                                            Asks what decision it drives, then sometimes says &quot;you don&#39;t need this&quot;
+**Upstream schema changes**                  Finds out when the pipeline breaks                   Has a data contract / test that fails loudly *before* prod breaks
+**Reviewing a PR**                           Checks if the logic is correct                       Checks the blast radius: who consumes this table, what&#39;s the rollback
+**Defining &quot;done&quot;**                          Pipeline runs and output looks right                 There&#39;s an SLA, an owner, alerting, and a documented recovery runbook
+**A teammate is stuck**                      Solves it for them                                   Pairs, explains the reasoning, and leaves them able to do it next time
+</code></pre>
+<p>The rest of this article is the <em>why</em> behind each row.</p>
+<h2>What is idempotency, and why do seniors obsess over it?</h2>
+<p>Idempotency means running the same operation multiple times produces the same result as running it once. In data engineering this is the single highest-leverage concept that separates levels, because pipelines <em>will</em> be re-run — on retry, on backfill, on manual intervention at 2am by someone half-awake.</p>
+<p>A mid-level engineer writes an <code>INSERT</code> that appends today&#39;s rows. It works. Then a downstream timeout triggers an automatic retry, the insert runs twice, and now a partition has double the rows. Revenue is overstated. Nobody notices for a week.</p>
+<p>A senior writes the load so that re-running it converges to the same state. The two common patterns:</p>
+<ol>
+<li><strong>Delete-then-insert on a partition key</strong> — wipe the target partition, then load it. Rerun a hundred times; the partition holds the same rows.</li>
+<li><strong><code>MERGE</code> / upsert on a natural key</strong> — match on a business key and update-or-insert, so duplicates are impossible by construction.</li>
+</ol>
+<pre><code class="language-sql">-- Idempotent: safe to run any number of times for a given day
+-- Databricks / Delta Lake SQL (SET * / INSERT * is Delta-specific)
+MERGE INTO analytics.orders AS t
+USING staging.orders_2026_06_18 AS s
+ON  t.order_id = s.order_id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/senior-vs-mid-data-engineer-d2.png" alt="Idempotency in practice: a non-idempotent backfill double-counts on rerun; an idempotent one (delete-then-insert or MERGE on a partition key) converges to the same state no matter how many times it runs.">
+<em>Idempotency in practice: a non-idempotent backfill double-counts on rerun; an idempotent one (delete-then-insert or MERGE on a partition key) converges to the same state no matter how many times it runs.</em></p>
+<p>The senior tell isn&#39;t <em>knowing</em> this — most mid-levels can define idempotency in an interview. The tell is that they build it reflexively, even under deadline pressure, because they&#39;ve been burned and they know &quot;I&#39;ll just be careful when I rerun it&quot; is a lie you tell yourself at 9am and regret at 3am.</p>
+<h2>Why is a backfill not just &quot;running the pipeline on old data&quot;?</h2>
+<p>A mid-level engineer treats a backfill as a separate, one-time event: a throwaway script, run once, deleted. The senior insight is that <strong>the backfill and the daily run should be the same code path, parameterized by a time window.</strong> If your daily job and your backfill are different code, you now have two ways to be wrong, and the backfill — the one you test least — is the one operating on the most data.</p>
+<p>Seniors design backfills to be:</p>
+<ul>
+<li><strong>Partition-safe</strong>: each partition is independently re-runnable (see idempotency above).</li>
+<li><strong>Chunked and rate-limited</strong>: a two-year backfill that scans everything in one query is how you get a surprise bill or a throttled warehouse. Loop over partitions.</li>
+<li><strong>Observable mid-flight</strong>: you can see progress and stop/resume, because backfills are long and <em>will</em> get interrupted.</li>
+</ul>
+<p>When someone proposes a backfill plan that&#39;s just &quot;I&#39;ll write a script,&quot; that&#39;s a mid-level signal. When they say &quot;it&#39;s the same DAG, I&#39;ll just pass a start and end date and run it partition by partition,&quot; that&#39;s senior.</p>
+<h2>How does cost-awareness separate the levels?</h2>
+<p>This is the skill that&#39;s exploded in importance. In the cloud-warehouse era, <strong>a single careless query can cost real money</strong>, and an unbounded pipeline can quietly burn budget for months before anyone notices.</p>
+<p>The mid-level engineer writes correct SQL and stops there. The senior engineer knows the <em>pricing model</em> of their platform and designs against it. The major cloud warehouses bill on roughly two models, and which one you&#39;re on changes everything about how you optimize:</p>
+<ul>
+<li><strong>Bytes-scanned (on-demand) pricing</strong> — e.g., Google BigQuery&#39;s on-demand model charges per terabyte of data <em>scanned</em> by a query (BigQuery documents this; check current per-TB rates as they change). Here, the senior move is partition pruning, clustering, avoiding <code>SELECT *</code>, and materializing intermediate results so you don&#39;t re-scan raw data repeatedly.</li>
+<li><strong>Compute-time / credit pricing</strong> — e.g., Snowflake bills for warehouse compute by the second while a virtual warehouse is running (per Snowflake&#39;s documented credit model; rates and editions vary — check current pricing). Here the senior move is right-sizing warehouses, aggressive auto-suspend, and not leaving a large warehouse running for a trickle of queries.</li>
+</ul>
+<blockquote>
+<p>Exact prices change constantly and vary by region, edition, and contract — never quote a number from memory. The senior skill isn&#39;t memorizing rates; it&#39;s <em>knowing which model you&#39;re billed on</em> and reaching for the right lever.</p>
+</blockquote>
+<p>A senior reads a query and sees dollars. They&#39;ll catch a join that explodes scanned bytes in review the way a mid-level catches a syntax error. They also build cost observability — tagging, per-pipeline cost attribution — so the question &quot;what does this pipeline cost?&quot; has an answer before Finance asks.</p>
+<h2>What are data contracts and SLAs, and why do seniors insist on them?</h2>
+<p>A <strong>data contract</strong> is an explicit, enforced agreement about the shape and meaning of data crossing a boundary — column names, types, nullability, semantics, freshness. A <strong>Service Level Agreement (SLA)</strong> is the promise about a dataset: &quot;the orders table is fresh by 6am, 99% of days.&quot;</p>
+<p>Mid-level engineers consume upstream data as-is and discover breakages when their pipeline explodes. Seniors treat every input as a boundary that needs a contract and every output as a product that needs an SLA. Concretely, a senior:</p>
+<ul>
+<li>Writes schema and freshness <strong>tests that fail loudly before bad data propagates</strong> (this is a core reason tools like dbt tests and contract-enforcement features exist).</li>
+<li>Defines who <em>owns</em> a dataset and what the consumers are promised.</li>
+<li>Negotiates with upstream producers instead of silently absorbing their chaos.</li>
+</ul>
+<p>The behavioral difference: when upstream adds a nullable column or changes a type, the mid-level pipeline breaks in production and someone gets paged. The senior pipeline has a contract test that fails in CI or at ingestion, with a clear message, before anything downstream is touched. (For how this maps onto a real codebase, see the cross-linked piece on <a href="dbt-project-structure">dbt project structure</a>.)</p>
+<h2>How do seniors design for failure and observability?</h2>
+<p>Junior and mid-level engineers design the <strong>happy path</strong>. Senior engineers assume <strong>everything fails</strong> — networks, upstreams, their own code — and design so that failure is <em>visible, bounded, and recoverable</em>.</p>
+<p>The mid-level mental model: &quot;the pipeline ran, the output looks right, we&#39;re done.&quot; The senior definition of done includes:</p>
+<ol>
+<li><strong>Alerting on the right signal</strong> — not &quot;the job threw an exception&quot; but &quot;the data is late / wrong / anomalous.&quot; Freshness and volume checks catch the failures that don&#39;t throw.</li>
+<li><strong>A runbook</strong> — when this pipeline fails at 3am, the on-call engineer (who isn&#39;t you) can recover it from a documented procedure.</li>
+<li><strong>Graceful degradation</strong> — partial failures don&#39;t corrupt the whole dataset; a bad partition is isolated, not silently mixed in.</li>
+<li><strong>Retries that are safe</strong> — which only works <em>because</em> the pipeline is idempotent. These skills compound.</li>
+</ol>
+<p>The deepest version of this is emotional, not technical: seniors have internalized that they will not be in the room when their code fails. They build for the colleague who inherits the 3am page. Mid-levels, often, are still building for themselves on a good day.</p>
+<h2>When should a senior data engineer NOT build something?</h2>
+<p>This is the most counterintuitive senior skill and the hardest to fake. <strong>The highest-leverage thing a senior does is sometimes prevent work from happening.</strong></p>
+<p>A mid-level engineer, asked for a pipeline or a dashboard, builds it — building is the job, and a completed build feels like progress. A senior asks the question behind the request: <em>What decision does this drive? Who looks at it? Does this already exist somewhere?</em> Often the right answer is one of:</p>
+<ul>
+<li>&quot;This dashboard duplicates one we already have — let me point you to it.&quot;</li>
+<li>&quot;You need this number once a quarter; a query is fine, you don&#39;t need a pipeline.&quot;</li>
+<li>&quot;The real problem is the upstream data quality; a new pipeline just launders bad data into a prettier format.&quot;</li>
+</ul>
+<p>Every pipeline you build is a liability you maintain forever. Seniors price in that lifetime cost. The willingness to say &quot;we shouldn&#39;t build this&quot; — and to make that case to a stakeholder without sounding obstructive — is, in my experience, the single clearest senior signal. It requires technical judgment <em>and</em> the standing to push back. (This judgment also shows up in big architecture calls — see the cross-linked <a href="warehouse-decision-2026">warehouse decision guide for 2026</a>.)</p>
+<h2>How does a senior translate for stakeholders?</h2>
+<p>Mid-level engineers talk in terms of tables, jobs, and schemas. Senior engineers translate between the technical layer and the business layer in both directions.</p>
+<p>That means: turning a vague ask (&quot;I need to see customer health&quot;) into a concrete spec with defined metrics, grain, and freshness — <em>and</em> turning a technical constraint (&quot;we can&#39;t get real-time without 4x the cost&quot;) into a business trade-off the stakeholder can actually decide on. The senior doesn&#39;t make the business decision; they frame it so the right person can. A mid-level either over-commits (&quot;sure, real-time, no problem&quot;) or stonewalls (&quot;that&#39;s not possible&quot;). The senior says, &quot;Here are three options with their costs and latencies — which fits the decision you&#39;re making?&quot;</p>
+<h2>What does &quot;reviewing for blast radius&quot; mean in code review?</h2>
+<p>Give two engineers the same PR — a change to a transformation. The mid-level reviewer checks: is the logic correct? Are there tests? Good, approve.</p>
+<p>The senior reviewer asks a different question: <strong>if this is wrong, how far does the damage spread?</strong></p>
+<ul>
+<li>Who consumes this table downstream? (If the answer is &quot;the finance dashboard the CFO sees,&quot; the bar just went up.)</li>
+<li>Is this change backward-compatible, or does it break existing consumers?</li>
+<li>What&#39;s the rollback plan? Can we revert cleanly, or does this require a backfill to undo?</li>
+<li>Does this widen the blast radius of a <em>future</em> failure?</li>
+</ul>
+<p>Blast-radius thinking is why seniors seem &quot;slow&quot; on some reviews — they&#39;re not reading the diff, they&#39;re reading the dependency graph around the diff. A correct change with a huge blast radius and no rollback is more dangerous than a slightly messy change that&#39;s well-isolated.</p>
+<h2>How does mentoring distinguish a senior?</h2>
+<p>The final difference is multiplicative. A mid-level engineer&#39;s output is their own work. A senior&#39;s output includes <strong>everyone they make better.</strong></p>
+<p>The tell is in how they help. A mid-level engineer, asked for help, solves the problem — fixes the bug, writes the query, hands it back. A senior, faced with the same request, weighs whether solving it themselves or teaching it creates more long-term leverage. They pair, they explain the <em>reasoning</em> (not just the fix), they leave the other person able to handle the next one alone. They also do the unglamorous multiplier work: writing the runbook, improving the onboarding doc, setting the review standards that make the <em>whole team</em> think about blast radius without being asked.</p>
+<p>This is also the skill that scales a senior past their own keyboard — and it&#39;s the one that, more than any tool on a résumé, marks the transition from &quot;writes great pipelines&quot; to &quot;makes the team write great pipelines.&quot;</p>
+<h2>FAQ</h2>
+<p><strong>Is the difference between mid and senior just years of experience?</strong>
+No. Years are weakly correlated at best. Plenty of engineers with eight years have only ever built happy-path pipelines for themselves; some with four years already reason about idempotency, cost, and blast radius reflexively. The differentiator is the <em>quality of judgment under failure, cost, and time pressure</em> — and how many other engineers you make better — not tenure.</p>
+<p><strong>What&#39;s the single fastest way to start operating at a senior level?</strong>
+Make everything you build idempotent and rerunnable, by default, today. It forces you to think about failure and retries, it&#39;s the foundation that safe backfills and safe retries are built on, and it&#39;s a habit you can adopt this week without permission from anyone.</p>
+<p><strong>Do seniors need to know more tools than mid-level engineers?</strong>
+Usually fewer, used more deliberately. Tool-chasing is often a mid-level pattern. Seniors tend to go deep on a small, stable stack and spend their attention on the system properties — cost, contracts, observability — that are tool-independent and survive the next migration.</p>
+<p><strong>How do I demonstrate &quot;knowing when not to build&quot; without looking lazy or obstructive?</strong>
+Always pair the &quot;no&quot; with the alternative and the reasoning: &quot;Instead of a new pipeline, here&#39;s the existing table that already answers this / here&#39;s a one-off query, because you need this number quarterly, not daily.&quot; You&#39;re not refusing work; you&#39;re protecting the stakeholder from a maintenance liability they didn&#39;t know they were asking for.</p>
+<p><strong>Is cost-awareness really an engineering skill or a finance concern?</strong>
+It&#39;s an engineering skill now. In consumption-priced cloud warehouses, the architecture of your query and pipeline <em>is</em> the cost. Knowing whether you&#39;re billed on bytes scanned or compute time, and designing against that model, is as much a part of correctness as getting the numbers right. Always check current pricing — rates and models change — but build the awareness in from the start.</p>
+<hr>
+<p><em>If this matched your experience — or contradicted it — I&#39;d genuinely like to hear which row of that table hit hardest. The line between mid and senior is blurrier and more honest than any job ladder admits.</em></p>

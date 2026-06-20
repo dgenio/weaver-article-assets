@@ -1,0 +1,133 @@
+<p><em>Calculate sample size for a conversion-rate A/B test with statsmodels — plus the power, alpha, and MDE decisions that drive the number.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/cover-ab-test-sample-size.png" alt="A/B Test Sample Size: The Formula, the Python, and the Mistakes That Waste Your Time">
+<strong>To find the sample size for an A/B test on a conversion rate, you need four inputs: the baseline rate, the minimum detectable effect (MDE) you care about, the significance level (alpha, usually 0.05), and the statistical power (usually 0.80). Plug them into the two-proportion sample-size formula. In Python, convert the two rates to a standardized effect size with <code>statsmodels</code>&#39; <code>proportion_effectsize</code>, then solve for n with <code>NormalIndPower().solve_power</code>. The result is the number of users <em>per arm</em> — and the single biggest lever is the MDE, because required n scales with roughly 1/MDE².</strong></p>
+<p>Most teams run A/B tests they were never statistically equipped to win. They ship a variant, watch the dashboard for a week, see &quot;no significant difference,&quot; and conclude the change didn&#39;t work. Often the truth is that the test never had a chance: it was underpowered from the first user. Calculating sample size <em>before</em> you launch is the cheapest insurance in all of experimentation. This article walks through the formula, the runnable Python, a worked numeric example, a reference table, and the mistakes that quietly waste weeks of traffic.</p>
+<h2>What is &quot;sample size&quot; actually answering?</h2>
+<p>Sample size answers a deceptively simple question: <em>how many users do I need in each group so that, if a real effect of a given size exists, my test will probably detect it?</em></p>
+<p>That sentence hides four parameters, and you must choose all four before the math works:</p>
+<ul>
+<li><strong>Baseline conversion rate (p₁).</strong> Your current control rate — say 5% of visitors convert. Pull this from real historical data, not a guess.</li>
+<li><strong>Minimum detectable effect (MDE).</strong> The smallest improvement worth detecting. If you only care about lifts of 1 percentage point or more (5% → 6%), that 1pp is your MDE. Smaller MDE = much larger sample.</li>
+<li><strong>Significance level (alpha, α).</strong> Your tolerance for a false positive — concluding the variant works when it doesn&#39;t. Convention is 0.05.</li>
+<li><strong>Statistical power (1 − β).</strong> Your probability of detecting a real effect of MDE size. Convention is 0.80, meaning you accept a 20% chance of missing a true effect.</li>
+</ul>
+<p>Get these four, and the required sample size is determined. There&#39;s no fifth degree of freedom to negotiate.</p>
+<h2>What is the two-proportion sample-size formula?</h2>
+<p>For comparing two conversion rates with a two-sided test, the classic approximation for the number of observations <em>per group</em> is:</p>
+<pre><code>n = (z_(1−α/2) + z_(1−β))² × [ p₁(1−p₁) + p₂(1−p₂) ] / (p₂ − p₁)²
+</code></pre>
+<p>Where:</p>
+<ul>
+<li><code>z_(1−α/2)</code> is the standard-normal critical value for your alpha (≈ 1.96 for α = 0.05, two-sided),</li>
+<li><code>z_(1−β)</code> is the critical value for your power (≈ 0.84 for 80% power),</li>
+<li><code>p₁</code> is the baseline rate and <code>p₂ = p₁ + MDE</code> is the rate you want to be able to detect,</li>
+<li>the denominator <code>(p₂ − p₁)²</code> is the effect size squared — which is why shrinking the MDE blows up n.</li>
+</ul>
+<p>You can compute this by hand, but in practice you should let a library handle the edge cases. <code>statsmodels</code> uses a slightly more refined approach based on the <strong>arcsine-transformed effect size (Cohen&#39;s h)</strong>, which behaves better for proportions near 0 or 1 and matches R&#39;s <code>pwr</code> package.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/ab-test-sample-size-d1.png" alt="How the four inputs (baseline rate, MDE, alpha, power) flow into the sample-size formula and out to required n per arm.">
+<em>How the four inputs (baseline rate, MDE, alpha, power) flow into the sample-size formula and out to required n per arm.</em></p>
+<h2>How do I calculate A/B test sample size in Python?</h2>
+<p>Here is the canonical, runnable approach with <code>statsmodels</code>. Two functions do the work: <code>proportion_effectsize</code> turns your two rates into Cohen&#39;s h, and <code>NormalIndPower().solve_power</code> solves the power equation for whichever argument you leave as <code>None</code>.</p>
+<pre><code class="language-python">from statsmodels.stats.power import NormalIndPower
+from statsmodels.stats.proportion import proportion_effectsize
+import numpy as np
+
+def sample_size_per_arm(baseline, mde, alpha=0.05, power=0.80, ratio=1.0):
+    &quot;&quot;&quot;Required sample size PER ARM for a two-proportion A/B test.
+
+    baseline : current conversion rate, e.g. 0.05
+    mde      : minimum detectable effect as an ABSOLUTE lift, e.g. 0.01 (1pp)
+    alpha    : false-positive tolerance (two-sided)
+    power    : probability of detecting a true effect of size `mde`
+    ratio    : nobs2 / nobs1 (1.0 = equal-sized groups)
+    &quot;&quot;&quot;
+    p1 = baseline
+    p2 = baseline + mde
+    # Cohen&#39;s h: 2*(arcsin(sqrt(p2)) - arcsin(sqrt(p1)))
+    effect = proportion_effectsize(p2, p1)
+    n1 = NormalIndPower().solve_power(
+        effect_size=effect,
+        alpha=alpha,
+        power=power,
+        ratio=ratio,
+        alternative=&quot;two-sided&quot;,
+    )
+    return int(np.ceil(n1))
+
+n = sample_size_per_arm(baseline=0.05, mde=0.01)
+print(f&quot;Need ~{n:,} users per arm  (~{2*n:,} total)&quot;)
+# Need ~8,143 users per arm  (~16,286 total)
+</code></pre>
+<p>A few things worth knowing about this API:</p>
+<ul>
+<li><code>solve_power</code> solves for whatever you set to <code>None</code>. Leave <code>power=None</code> to find the power of a test you already ran; leave <code>nobs1=None</code> (the default when you don&#39;t pass it) to solve for sample size.</li>
+<li><code>nobs1</code> is the size of <strong>group 1</strong>, and <code>nobs2 = nobs1 * ratio</code>. With <code>ratio=1.0</code> the number returned is your per-arm size.</li>
+<li><code>proportion_effectsize(p2, p1)</code> returns Cohen&#39;s h via the arcsine transform: <code>2*(arcsin(sqrt(p2)) - arcsin(sqrt(p1)))</code>. Sign depends on argument order; sample size depends only on its magnitude.</li>
+</ul>
+<p><strong>A note on relative vs. absolute MDE.</strong> Product teams usually think in <em>relative</em> lift (&quot;a 20% improvement&quot;). A 20% relative lift on a 5% baseline is an absolute lift of 0.05 × 0.20 = 0.01 (1pp), so <code>mde=0.01</code>. Mixing these up is one of the most common ways to mis-size a test by a factor of several. Decide which one you mean and convert explicitly.</p>
+<h2>What actually drives the number?</h2>
+<p>Of the four inputs, they are not equal in influence:</p>
+<ol>
+<li><strong>MDE dominates.</strong> Sample size scales with roughly 1/MDE². Halving the effect you want to detect <em>quadruples</em> your required traffic. This is the lever, and it&#39;s the one teams are most tempted to fudge.</li>
+<li><strong>Baseline rate matters through variance.</strong> Rates near 50% have the most variance — <code>p(1−p)</code> is maximized at 0.5 — so they need more samples for the same absolute MDE. A 1pp lift is much &quot;bigger&quot; relative to a 2% baseline than to a 50% baseline.</li>
+<li><strong>Power and alpha matter less, but they matter.</strong> Moving power from 0.80 to 0.90 increases n by roughly a third. Tightening alpha from 0.05 to 0.01 also raises it. These are real costs but rarely the thing that makes a test infeasible.</li>
+</ol>
+<h2>A worked numeric example</h2>
+<p>Suppose your checkout page converts at <strong>5%</strong> and you want to detect at least a <strong>1 percentage point</strong> absolute improvement (to 6%) — a sizable 20% relative lift. You use the conventional α = 0.05 and power = 0.80.</p>
+<p>Running <code>sample_size_per_arm(baseline=0.05, mde=0.01)</code> returns <strong>≈ 8,143 users per arm</strong>, or about <strong>16,286 total</strong>.</p>
+<p>Now suppose your real product traffic is 2,000 eligible users per week, split evenly. You&#39;d need 16,286 / 2,000 ≈ <strong>8.1 weeks</strong> of clean traffic. If the most you can stomach is a three-week test, you have three honest options: accept a larger MDE (only chase bigger wins), reduce variance (see CUPED below), or don&#39;t run the test. What you must <em>not</em> do is run it for three weeks anyway and treat a null result as evidence the change failed.</p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/ab-test-sample-size-d2.png" alt="Sample size per arm grows roughly as 1/MDE^2: halving the detectable effect quadruples the required traffic.">
+<em>Sample size per arm grows roughly as 1/MDE^2: halving the detectable effect quadruples the required traffic.</em></p>
+<h2>Reference table: n per arm vs. MDE (5% baseline, α = 0.05, power = 0.80)</h2>
+<p>These are computed with the <code>statsmodels</code> snippet above for a 5% baseline, equal arms. Use them as ballpark intuition, not gospel — recompute for <em>your</em> baseline.</p>
+<pre><code class="language-text">MDE (absolute)   Variant rate   Relative lift   n per arm   Total n
+--------------   ------------   -------------   ---------   -------
+0.5 pp           5.5%           +10%            ~31,000     ~62,000
+1.0 pp           6.0%           +20%            ~8,200      ~16,400
+1.5 pp           6.5%           +30%            ~3,800      ~7,600
+2.0 pp           7.0%           +40%            ~2,300      ~4,600
+3.0 pp           8.0%           +60%            ~1,100      ~2,200
+</code></pre>
+<p>Read the table top to bottom and the 1/MDE² relationship jumps out: going from a 1pp to a 0.5pp MDE (halving it) takes you from ~8,200 to ~31,000 per arm — roughly 4×. This is the single most important intuition in test sizing.</p>
+<h2>Why underpowered tests waste time (and mislead)</h2>
+<p>An underpowered test is worse than no test, because it manufactures false confidence in both directions.</p>
+<ul>
+<li><strong>It hides real wins.</strong> With low power, a genuinely good variant frequently produces a non-significant result. The team concludes &quot;no effect,&quot; ships nothing, and the improvement is lost — sometimes permanently, because nobody re-tests a &quot;failed&quot; idea.</li>
+<li><strong>It inflates the wins it does report.</strong> This is the subtle one. When an underpowered test <em>does</em> hit significance, the observed effect is biased upward — a phenomenon often called the <strong>winner&#39;s curse</strong> or Type M (magnitude) error. You ship a &quot;30% lift&quot; that regresses to 8% in production, and trust in experimentation erodes.</li>
+</ul>
+<p>The fix is not heroics after the fact; it&#39;s sizing before launch. If the math says you can&#39;t reach adequate power in a reasonable window, that is itself a finding — change the MDE, reduce variance, or pick a different test.</p>
+<h2>How does peeking break your sample-size plan?</h2>
+<p>Sample-size math assumes you decide on n up front and evaluate <strong>once</strong>, at the end. &quot;Peeking&quot; — checking the p-value repeatedly and stopping the moment it dips below 0.05 — quietly destroys this. Each look is another chance for noise to cross the threshold, so your real false-positive rate balloons well above the nominal 5%. With enough peeks, you can manufacture &quot;significance&quot; from pure noise a large fraction of the time.</p>
+<p>If you genuinely need to monitor and stop early, don&#39;t eyeball a fixed-horizon test. Use a method designed for continuous evaluation — <strong>sequential testing</strong> with alpha-spending (e.g., O&#39;Brien–Fleming group-sequential boundaries) or <strong>always-valid inference</strong> based on confidence sequences. These deliberately adjust the threshold over time so the error rate stays controlled. Peeking and pre-computed sample size are two halves of the same discipline; I cover the full set of traps in the companion piece on <a href="ab-test-pitfalls">common A/B test pitfalls</a>.</p>
+<h2>When can you get away with a smaller sample? (Variance reduction)</h2>
+<p>The sample-size formula has variance in its numerator. Cut the variance and you cut the required n — without touching alpha, power, or the effect you can detect. The most popular technique is <strong>CUPED</strong> (Controlled-experiment Using Pre-Existing Data), introduced by Microsoft.</p>
+<p>The intuition: a user&#39;s behavior <em>before</em> the experiment predicts their behavior during it. CUPED uses a pre-period covariate (e.g., each user&#39;s purchases in the 4 weeks before the test) to remove the predictable part of the metric, shrinking variance by the square of the covariate&#39;s correlation with the outcome. In practice teams report variance reductions that translate to materially shorter tests for the same power. It changes the metric you analyze, not the randomization, so it composes cleanly with everything above. I walk through the math and a NumPy implementation in the dedicated <a href="cuped">CUPED</a> article.</p>
+<p>A quick comparison of the levers:</p>
+<pre><code class="language-text">Lever                           Effect on required n                Cost / trade-off                                 When to reach for it
+-----------------------------   ---------------------------------   ----------------------------------------------   -----------------------------------------------
+Raise MDE (chase bigger wins)   Drops fast (~1/MDE²)                You become blind to small-but-real lifts         When small effects aren&#39;t worth shipping anyway
+Lower power (0.80 → 0.70)       Modest drop                         Higher chance of missing true effects            Rarely — usually a false economy
+Loosen alpha (0.05 → 0.10)      Modest drop                         More false positives                             Early-stage, low-stakes exploration only
+Variance reduction (CUPED)      Drops with covariate correlation²   Engineering effort; needs good pre-period data   When you have predictive pre-experiment data
+</code></pre>
+<h2>When should you <em>not</em> bother with formal sample sizing?</h2>
+<p>Honesty matters here. Formal power analysis is overhead, and there are cases where it&#39;s the wrong tool:</p>
+<ul>
+<li><strong>You don&#39;t have the traffic, period.</strong> If the table tells you a meaningful test needs 16k users per arm and you get 200 visitors a week, no amount of sizing math fixes that. Consider a qualitative method, a bigger swing (larger MDE), or a different decision process entirely.</li>
+<li><strong>The change is a no-brainer or a bug fix.</strong> You don&#39;t need an experiment to justify fixing a broken checkout button.</li>
+<li><strong>You&#39;re measuring a guardrail, not chasing a win.</strong> Sometimes you ship and simply monitor for harm; that&#39;s a different statistical question.</li>
+</ul>
+<p>Formal sizing earns its keep when the decision is genuinely uncertain, the effect is plausibly small, and the cost of being wrong is real. That&#39;s most product experiments — but not all of them.</p>
+<h2>FAQ</h2>
+<p><strong>What sample size do I need for an A/B test?</strong>
+It depends on four inputs: baseline conversion rate, minimum detectable effect, alpha (typically 0.05), and power (typically 0.80). For a 5% baseline and a 1pp absolute MDE at standard settings, you need roughly 8,200 users <em>per arm</em>. Always compute it for your own baseline rather than copying a number — use the <code>statsmodels</code> snippet above.</p>
+<p><strong>What&#39;s the difference between absolute and relative MDE?</strong>
+Absolute MDE is the raw difference in rates (5% → 6% is 1pp). Relative MDE is the percentage change (5% → 6% is a 20% relative lift). The formula uses the absolute difference, so convert relative targets first: relative MDE × baseline = absolute MDE. Confusing the two is a leading cause of mis-sized tests.</p>
+<p><strong>Is the sample size per group or total?</strong>
+<code>NormalIndPower().solve_power</code> with <code>ratio=1.0</code> returns the size of one group (per arm). Double it for the total users you need across control and variant.</p>
+<p><strong>Why does a smaller effect need so many more users?</strong>
+Required sample size scales with roughly 1/MDE². Detecting an effect half as large needs about four times the traffic, because you&#39;re trying to separate a smaller signal from the same noise. This is why MDE is the most consequential input you choose.</p>
+<p><strong>Can I just stop the test early once it&#39;s significant?</strong>
+Not with a fixed-horizon design — that&#39;s peeking, and it inflates your false-positive rate well beyond 5%. If you need to stop early, use sequential testing or always-valid inference, which adjust the significance threshold to keep error rates controlled. See the <a href="ab-test-pitfalls">A/B test pitfalls</a> piece for details.</p>
+<p><strong>Does CUPED reduce the sample size I need?</strong>
+Effectively yes. CUPED reduces the <em>variance</em> of your metric using pre-experiment data, and since variance is in the numerator of the sample-size formula, lower variance means fewer users for the same power. It doesn&#39;t change your randomization or alpha. See the <a href="cuped">CUPED</a> walkthrough.</p>

@@ -1,0 +1,221 @@
+<p><em>Dedup, gaps-and-islands, running totals, MERGE, QUALIFY, sessionization — real-pipeline patterns with tight, runnable snippets.</em></p>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/cover-sql-patterns-data-engineers.png" alt="10 SQL Patterns Every Data Engineer Should Know By Heart">
+<strong>The ten SQL patterns every data engineer should know by heart are: deduplication with <code>ROW_NUMBER</code>, gaps-and-islands, running totals, pivot/unpivot, anti-joins for missing rows, date-spine (calendar) joins, top-N per group, incremental upsert with <code>MERGE</code>, <code>QUALIFY</code> for filtering window results, and sessionization.</strong> Master these and you can express the vast majority of real pipeline logic — dedup, change tracking, time-series rollups, and incremental loads — without reaching for a procedural language. Almost all of them are built on window functions, which is why window functions are the single highest-leverage thing to learn in SQL. Every snippet below is runnable; dialect differences are flagged inline.</p>
+<p>A quick note before the list: these are <em>patterns</em>, not silver bullets. I&#39;ve called out where each one quietly falls apart at scale or hides a correctness bug. If you&#39;re newer to the window-function machinery underneath several of these, my deeper walkthrough of <a href="sql-window-functions">SQL window functions</a> is a good companion read.</p>
+<h2>Which pattern solves which problem?</h2>
+<p>If you only skim one thing, skim this table. It maps the everyday question to the pattern and the core construct.</p>
+<pre><code class="language-text">The problem you actually have                 Pattern              Core construct                                            Notes
+-------------------------------------------   ------------------   -------------------------------------------------------   --------------------------------------------------
+&quot;I have duplicate rows, keep the latest&quot;      Deduplication        `ROW_NUMBER() OVER (PARTITION BY key ORDER BY ts DESC)`   Pick the tie-breaker deliberately
+&quot;Find consecutive streaks / outage windows&quot;   Gaps-and-islands     `ROW_NUMBER` difference trick                             Classic interview question, real ops use
+&quot;Cumulative sum / 7-day rolling&quot;              Running totals       `SUM(x) OVER (ORDER BY ...)`                              Watch the frame clause
+&quot;Rows to columns / columns to rows&quot;           Pivot / unpivot      `CASE` + aggregate, or `UNPIVOT`                          Dialect-specific `PIVOT` exists too
+&quot;Which keys are missing from table B?&quot;        Anti-join            `LEFT JOIN ... WHERE b.id IS NULL` or `NOT EXISTS`        `NOT IN` is a NULL trap
+&quot;Fill in dates with zero activity&quot;            Date spine           `LEFT JOIN` a generated calendar                          `generate_series` / `GENERATE_DATE_ARRAY`
+&quot;Top 3 products per category&quot;                 Top-N per group      `ROW_NUMBER`/`RANK` + filter                              `RANK` keeps ties
+&quot;Load only new/changed rows&quot;                  Incremental upsert   `MERGE`                                                   Beware concurrent duplicate keys
+&quot;Filter on a window result&quot;                   `QUALIFY`            `QUALIFY rn = 1`                                          Not in standard SQL; Snowflake/BigQuery/Databricks
+&quot;Group events into sessions&quot;                  Sessionization       `LAG` + conditional sum                                   30-min inactivity = new session
+</code></pre>
+<p>Now the patterns themselves.</p>
+<h2>1. Deduplication with ROW_NUMBER</h2>
+<p>The problem: an upstream system delivered the same logical record more than once and you need exactly one row per key — usually the newest.</p>
+<pre><code class="language-sql">SELECT *
+FROM (
+  SELECT
+    *,
+    ROW_NUMBER() OVER (
+      PARTITION BY user_id
+      ORDER BY updated_at DESC, event_id DESC
+    ) AS rn
+  FROM raw_events
+) t
+WHERE rn = 1;
+</code></pre>
+<p>Two things people get wrong. First, always add a deterministic tie-breaker (<code>event_id DESC</code> above) — if two rows share <code>updated_at</code>, <code>ROW_NUMBER</code> will still pick one, but <em>which</em> one becomes non-deterministic across runs, which silently breaks reproducibility. Second, use <code>ROW_NUMBER</code> (not <code>RANK</code>) when you want exactly one row; <code>RANK</code> returns all tied rows.</p>
+<p>When <em>not</em> to use it: if duplicates are byte-identical, a plain <code>SELECT DISTINCT</code> or <code>GROUP BY</code> is cheaper and clearer.</p>
+<h2>2. Gaps-and-islands</h2>
+<p>The problem: you have rows that should form continuous runs (consecutive login days, a device that was online for a stretch) and you want to collapse each run into one row with a start and end. This is the famous &quot;gaps-and-islands&quot; problem.</p>
+<p>The trick: subtract a per-group <code>ROW_NUMBER</code> from the sequence value. Within a continuous run the difference is constant, so it becomes a group key.</p>
+<pre><code class="language-sql">WITH numbered AS (
+  SELECT
+    user_id,
+    activity_date,
+    activity_date
+      - (ROW_NUMBER() OVER (
+          PARTITION BY user_id ORDER BY activity_date
+        ) * INTERVAL &#39;1 day&#39;) AS grp
+  FROM daily_activity
+)
+SELECT
+  user_id,
+  MIN(activity_date) AS streak_start,
+  MAX(activity_date) AS streak_end,
+  COUNT(*)           AS streak_length
+FROM numbered
+GROUP BY user_id, grp
+ORDER BY user_id, streak_start;
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/sql-patterns-data-engineers-d1.png" alt="Gaps-and-islands: how a difference-of-row-numbers trick collapses consecutive rows into groups (islands) separated by gaps.">
+<em>Gaps-and-islands: how a difference-of-row-numbers trick collapses consecutive rows into groups (islands) separated by gaps.</em></p>
+<p>Dialect note: the <code>INTERVAL &#39;1 day&#39;</code> arithmetic is Postgres-style. In BigQuery use <code>DATE_SUB(activity_date, INTERVAL rn DAY)</code>; in SQL Server use <code>DATEADD(day, -rn, activity_date)</code>. The <em>idea</em> is identical everywhere.</p>
+<h2>3. Running totals and rolling windows</h2>
+<p>The problem: cumulative revenue to date, or a 7-day moving average.</p>
+<pre><code class="language-sql">SELECT
+  order_date,
+  daily_revenue,
+  SUM(daily_revenue) OVER (
+    ORDER BY order_date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS running_total,
+  AVG(daily_revenue) OVER (
+    ORDER BY order_date
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ) AS rolling_7day_avg
+FROM daily_sales;
+</code></pre>
+<p>The frame clause is the part everyone forgets. With an <code>ORDER BY</code> but no explicit frame, most engines default to <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. The subtle bug: <code>RANGE</code> groups <em>peer</em> rows (ties on the order key) together, so duplicate dates get the same running total. If you want strict row-by-row accumulation, write <code>ROWS</code> explicitly. This single distinction causes more &quot;my running total looks wrong&quot; tickets than anything else.</p>
+<p>Caveat: a 7-<code>ROWS</code> window is not the same as a 7-<em>day</em> window if dates are missing. For a true calendar window you need a date spine (pattern 6) first, or a <code>RANGE ... INTERVAL</code> frame where supported.</p>
+<h2>4. Pivot and unpivot</h2>
+<p>The problem: turn rows into columns (a monthly crosstab) or columns back into rows (wide source table → tidy long table).</p>
+<p>The portable pivot is conditional aggregation — it works in every dialect:</p>
+<pre><code class="language-sql">SELECT
+  product_id,
+  SUM(CASE WHEN quarter = &#39;Q1&#39; THEN revenue END) AS q1,
+  SUM(CASE WHEN quarter = &#39;Q2&#39; THEN revenue END) AS q2,
+  SUM(CASE WHEN quarter = &#39;Q3&#39; THEN revenue END) AS q3,
+  SUM(CASE WHEN quarter = &#39;Q4&#39; THEN revenue END) AS q4
+FROM sales
+GROUP BY product_id;
+</code></pre>
+<p>Unpivot (wide → long), also portable:</p>
+<pre><code class="language-sql">SELECT product_id, &#39;q1&#39; AS quarter, q1 AS revenue FROM wide_sales
+UNION ALL
+SELECT product_id, &#39;q2&#39;, q2 FROM wide_sales
+UNION ALL
+SELECT product_id, &#39;q3&#39;, q3 FROM wide_sales
+UNION ALL
+SELECT product_id, &#39;q4&#39;, q4 FROM wide_sales;
+</code></pre>
+<p>Dialect note: SQL Server and Oracle have dedicated <code>PIVOT</code>/<code>UNPIVOT</code> operators; BigQuery and Snowflake support <code>PIVOT</code> too. They read nicely but require you to enumerate the pivot values — there&#39;s no truly dynamic pivot in standard SQL without generating the query string. When the column set is dynamic, do the pivot in your application or BI layer instead of fighting SQL.</p>
+<h2>5. Anti-join for missing rows</h2>
+<p>The problem: which customers in <code>orders</code> have no matching row in <code>shipments</code>? Reconciliation and data-quality checks live here.</p>
+<pre><code class="language-sql">-- LEFT JOIN / IS NULL form
+SELECT o.order_id
+FROM orders o
+LEFT JOIN shipments s ON s.order_id = o.order_id
+WHERE s.order_id IS NULL;
+
+-- NOT EXISTS form (often the planner&#39;s favorite)
+SELECT o.order_id
+FROM orders o
+WHERE NOT EXISTS (
+  SELECT 1 FROM shipments s WHERE s.order_id = o.order_id
+);
+</code></pre>
+<p>The trap to internalize: <strong>do not use <code>NOT IN</code> on a subquery that can return <code>NULL</code>.</strong> If any value in the <code>NOT IN</code> list is <code>NULL</code>, the entire predicate evaluates to unknown and you get <em>zero</em> rows back — silently. <code>NOT EXISTS</code> and the <code>LEFT JOIN</code>/<code>IS NULL</code> form are NULL-safe; prefer them. On most engines <code>NOT EXISTS</code> and the anti-join optimize to the same plan.</p>
+<h2>6. Date spine / calendar join</h2>
+<p>The problem: your report shows revenue per day, but days with no sales simply vanish — and a line chart with missing days lies. The fix is to generate a complete date range and <code>LEFT JOIN</code> your data onto it.</p>
+<pre><code class="language-sql">-- Postgres
+WITH calendar AS (
+  SELECT generate_series(
+    DATE &#39;2026-01-01&#39;, DATE &#39;2026-01-31&#39;, INTERVAL &#39;1 day&#39;
+  )::date AS d
+)
+SELECT
+  c.d AS order_date,
+  COALESCE(SUM(s.amount), 0) AS revenue
+FROM calendar c
+LEFT JOIN sales s ON s.order_date = c.d
+GROUP BY c.d
+ORDER BY c.d;
+</code></pre>
+<p>Dialect note: BigQuery uses <code>GENERATE_DATE_ARRAY(&#39;2026-01-01&#39;,&#39;2026-01-31&#39;, INTERVAL 1 DAY)</code> with <code>UNNEST</code>. Snowflake uses <code>GENERATOR</code> + <code>DATEADD</code>. In production warehouses, most teams keep a permanent <code>dim_date</code> table instead of generating the spine each query — it&#39;s reusable and lets you join on fiscal periods, holidays, and weekday flags for free.</p>
+<h2>7. Top-N per group</h2>
+<p>The problem: top 3 best-selling products <em>within each category</em>. A plain <code>ORDER BY ... LIMIT</code> gives you the global top 3, not per group.</p>
+<pre><code class="language-sql">SELECT category, product_id, revenue
+FROM (
+  SELECT
+    category,
+    product_id,
+    revenue,
+    ROW_NUMBER() OVER (
+      PARTITION BY category ORDER BY revenue DESC
+    ) AS rn
+  FROM product_sales
+) t
+WHERE rn &lt;= 3
+ORDER BY category, rn;
+</code></pre>
+<p>Choose your ranking function on purpose: <code>ROW_NUMBER</code> gives exactly N rows (arbitrary tie-break), <code>RANK</code> keeps all ties (you might get 4+ rows on a tie), and <code>DENSE_RANK</code> keeps ties without skipping rank numbers. For &quot;top 3 and I don&#39;t care which on a tie,&quot; <code>ROW_NUMBER</code>. For &quot;everyone tied for 3rd counts,&quot; <code>RANK</code>.</p>
+<h2>8. Incremental upsert with MERGE</h2>
+<p>The problem: you have a batch of new and changed rows and you want to update existing keys and insert new ones in a single statement — the bread and butter of incremental loads.</p>
+<pre><code class="language-sql">MERGE INTO dim_customer AS tgt
+USING staging_customer AS src
+  ON tgt.customer_id = src.customer_id
+WHEN MATCHED THEN
+  UPDATE SET
+    name       = src.name,
+    email      = src.email,
+    updated_at = src.updated_at
+WHEN NOT MATCHED THEN
+  INSERT (customer_id, name, email, updated_at)
+  VALUES (src.customer_id, src.name, src.email, src.updated_at);
+</code></pre>
+<p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/sql-patterns-data-engineers-d2.png" alt="Incremental upsert flow: how MERGE routes each source row to UPDATE (matched) or INSERT (not matched) against the target table.">
+<em>Incremental upsert flow: how MERGE routes each source row to UPDATE (matched) or INSERT (not matched) against the target table.</em></p>
+<p><code>MERGE</code> is in standard SQL and supported by SQL Server, Oracle, BigQuery, Snowflake, and Databricks. The landmine: if the source has <strong>more than one row per key</strong>, behavior is undefined or errors (SQL Server raises, BigQuery errors). Always deduplicate the source first — pattern 1 — so each key appears once. Postgres historically used <code>INSERT ... ON CONFLICT DO UPDATE</code> instead of <code>MERGE</code> (native <code>MERGE</code> arrived in Postgres 15); on MySQL the equivalent is <code>INSERT ... ON DUPLICATE KEY UPDATE</code>.</p>
+<h2>9. QUALIFY — filter on window function results</h2>
+<p>The problem: you can&#39;t put a window function in a <code>WHERE</code> clause (it&#39;s evaluated after <code>WHERE</code>), so deduplication needs a subquery wrapper. <code>QUALIFY</code> is the window-function equivalent of <code>HAVING</code> and removes the wrapper entirely.</p>
+<pre><code class="language-sql">SELECT
+  user_id,
+  event_id,
+  updated_at
+FROM raw_events
+QUALIFY ROW_NUMBER() OVER (
+  PARTITION BY user_id ORDER BY updated_at DESC
+) = 1;
+</code></pre>
+<p>That&#39;s pattern 1 in three fewer lines. The honest caveat: <strong><code>QUALIFY</code> is not in the SQL standard.</strong> It works in Snowflake, BigQuery, Databricks, and DuckDB, but <em>not</em> in Postgres, MySQL, or SQL Server — there you must keep the subquery-and-<code>WHERE</code> form. If portability matters, stick with the wrapped subquery; if you live in a modern cloud warehouse, <code>QUALIFY</code> is one of the nicest quality-of-life features it offers. For more on what&#39;s safe to lean on in BigQuery specifically, see my notes on <a href="bigquery-antipatterns">BigQuery antipatterns</a>.</p>
+<h2>10. Sessionization</h2>
+<p>The problem: a stream of event timestamps per user, and you want to group them into sessions where a gap longer than (say) 30 minutes starts a new session. This is the canonical web-analytics pattern.</p>
+<pre><code class="language-sql">WITH gaps AS (
+  SELECT
+    user_id,
+    event_ts,
+    CASE
+      WHEN event_ts - LAG(event_ts) OVER (
+             PARTITION BY user_id ORDER BY event_ts
+           ) &gt; INTERVAL &#39;30 minutes&#39;
+        OR LAG(event_ts) OVER (
+             PARTITION BY user_id ORDER BY event_ts
+           ) IS NULL
+      THEN 1 ELSE 0
+    END AS is_new_session
+  FROM events
+)
+SELECT
+  user_id,
+  event_ts,
+  SUM(is_new_session) OVER (
+    PARTITION BY user_id ORDER BY event_ts
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS session_id
+FROM gaps;
+</code></pre>
+<p>The mechanics: <code>LAG</code> gets the previous event&#39;s timestamp; if the gap exceeds the threshold (or it&#39;s the user&#39;s first event), flag a new session with <code>1</code>; then a running <code>SUM</code> of that flag produces a monotonically increasing <code>session_id</code> per user. It&#39;s gaps-and-islands and running totals working together — which is exactly why those two are on this list. Dialect note: swap the <code>INTERVAL</code> arithmetic for <code>TIMESTAMP_DIFF(event_ts, prev_ts, MINUTE) &gt; 30</code> in BigQuery or <code>DATEDIFF(minute, ...)</code> in SQL Server.</p>
+<h2>How do these patterns relate to each other?</h2>
+<p>Notice how few primitives are actually in play. <code>ROW_NUMBER</code>, <code>LAG</code>/<code>LEAD</code>, and a windowed <code>SUM</code> cover deduplication, gaps-and-islands, top-N, running totals, and sessionization — five of the ten. Anti-joins, date spines, pivots, and <code>MERGE</code> are the non-window members. If you&#39;re going to invest study time, invest it in window functions and their frame clauses; everything else is composition.</p>
+<h2>FAQ</h2>
+<p><strong>What is the difference between ROW_NUMBER, RANK, and DENSE_RANK?</strong>
+<code>ROW_NUMBER</code> assigns a unique sequential number even to tied rows (so exactly one row per number). <code>RANK</code> gives tied rows the same number and then skips (1, 1, 3). <code>DENSE_RANK</code> gives tied rows the same number without skipping (1, 1, 2). Use <code>ROW_NUMBER</code> for deduplication and strict top-N; use <code>RANK</code>/<code>DENSE_RANK</code> when ties should be kept.</p>
+<p><strong>Why does my NOT IN query return no rows?</strong>
+Almost certainly a <code>NULL</code> in the subquery. <code>NOT IN (..., NULL, ...)</code> evaluates to unknown for every row, so the result set is empty. Switch to <code>NOT EXISTS</code> or a <code>LEFT JOIN ... WHERE x IS NULL</code>, both of which handle <code>NULL</code> correctly.</p>
+<p><strong>Is QUALIFY standard SQL?</strong>
+No. <code>QUALIFY</code> is a vendor extension supported by Snowflake, BigQuery, Databricks, and DuckDB, among others. It is not available in PostgreSQL, MySQL, or SQL Server, where you must wrap the window function in a subquery and filter in the outer <code>WHERE</code>. Check your engine&#39;s current documentation before relying on it.</p>
+<p><strong>What is the difference between ROWS and RANGE in a window frame?</strong>
+<code>ROWS</code> counts physical rows, so each row gets its own frame. <code>RANGE</code> includes all rows that are <em>peers</em> on the <code>ORDER BY</code> value (ties), so duplicate sort keys share a frame and therefore share the computed value. For row-by-row running totals, specify <code>ROWS</code> explicitly — the default frame is usually <code>RANGE</code>, which can surprise you on duplicate dates.</p>
+<p><strong>When should I avoid MERGE?</strong>
+Avoid <code>MERGE</code> (or pre-deduplicate the source) when the source can contain multiple rows per matching key — behavior is undefined or errors across engines. Also reconsider it under high write concurrency, where some engines can deadlock or produce duplicate inserts; an explicit <code>INSERT ... ON CONFLICT</code> (Postgres) or a delete-then-insert pattern is sometimes safer. Always check your engine&#39;s documented <code>MERGE</code> semantics.</p>
+<hr>
+<p><em>If you found this useful, the two deepest rabbit holes here are window-function frames and warehouse-specific gotchas — covered in <a href="sql-window-functions">SQL window functions</a> and <a href="bigquery-antipatterns">BigQuery antipatterns</a>.</em></p>
