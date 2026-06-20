@@ -4,7 +4,7 @@
 You inherit a 40-model dbt project. The previous analytics engineer left, and your <code>dbt test</code> suite has exactly nine tests in it — eight <code>not_null</code>s and one <code>unique</code> on a primary key someone added during an incident. Meanwhile a finance dashboard quietly served duplicated revenue for three weeks because nobody asserted that <code>order_id</code> was unique in the staging model.</p>
 <p>Writing tests for 40 models by hand is the kind of work that is simultaneously urgent and the first thing you deprioritize. It is repetitive, it is boring, and the boilerplate-to-insight ratio is brutal. So I did what a lot of us are quietly doing now: I fed the schema and some profiling stats to an LLM and asked it to propose the tests.</p>
 <p>It went better than I expected in some places and worse in ways that would have shipped silent bugs if I had trusted it. This is the workflow I landed on, the parts I now let the model own, and the three failure modes that will bite you if you paste its output without reading it.</p>
-<p>If you want a refresher on the test types themselves before going further, see the companion piece on <a href="dbt-tests">dbt tests</a>. This article assumes you know what <code>not_null</code> does and focuses on the <em>generation</em> problem.</p>
+<p>If you want a refresher on the test types themselves before going further, see the companion piece on dbt tests. This article assumes you know what <code>not_null</code> does and focuses on the <em>generation</em> problem.</p>
 <h2>The input matters more than the prompt</h2>
 <p>The single biggest lever is not prompt wording — it is what you put in the context window. An LLM handed only column names will guess from the names. That guessing is exactly where hallucinated tests come from. Handed actual profiling statistics, it stops guessing and starts describing the data you already have.</p>
 <p>So before prompting, profile the model. You do not need a fancy tool; a SQL query gets you most of the way. Here is a profiling query you can run against any warehouse table (this is standard ANSI SQL):</p>
@@ -138,7 +138,7 @@ dbt test --select assert_refunded_orders_have_refund_date
 <li><strong>Use it for volume, skip it for small or high-stakes suites.</strong> The economics only work when there&#39;s real boilerplate to absorb.</li>
 </ul>
 <p>I treat the LLM as a fast, tireless junior who has never met my stakeholders: great at the mechanical 70%, untrustworthy on the 30% that requires knowing the business. Gate accordingly and it genuinely speeds you up.</p>
-<p>If you want the test-type fundamentals this builds on, read the companion piece on <a href="dbt-tests">dbt tests</a>. And if you try this workflow — what&#39;s the weirdest test your LLM tried to sneak past you? I collect them. Follow along and drop yours in the responses.</p>
+<p>If you want the test-type fundamentals this builds on, read the companion piece on dbt tests. And if you try this workflow — what&#39;s the weirdest test your LLM tried to sneak past you? I collect them. Follow along and drop yours in the responses.</p>
 <h2>FAQ</h2>
 <p><strong>Can an LLM write dbt tests reliably?</strong>
 Yes, for the mechanical, verifiable part of a suite — roughly 60–70% of typical tests. It nails <code>not_null</code>, <code>unique</code>, and <code>accepted_values</code> when you gate generation on profiling stats. It is actively dangerous on <code>relationships</code> tests, invented thresholds, and business rules it can&#39;t see in the data.</p>

@@ -151,7 +151,7 @@ print(per_arm_n(0.10, 0.005))  # detect 10.0%-&gt;10.5%  -&gt; ~57,800 / arm
 <p><strong>The fix.</strong></p>
 <ul>
 <li><strong>Run a power calculation before every test.</strong> If the required n is unreachable, either widen the minimum detectable effect you&#39;ll commit to, or don&#39;t run the test.</li>
-<li><strong>Reduce variance instead of just adding users.</strong> This is where <a href="cuped">CUPED</a> earns its keep: by adjusting each user&#39;s metric with their pre-experiment behavior, it strips out variance you can predict, often cutting required sample size by a meaningful chunk. Lower variance is mathematically identical to more power — it&#39;s the cheapest power you&#39;ll ever buy.</li>
+<li><strong>Reduce variance instead of just adding users.</strong> This is where CUPED earns its keep: by adjusting each user&#39;s metric with their pre-experiment behavior, it strips out variance you can predict, often cutting required sample size by a meaningful chunk. Lower variance is mathematically identical to more power — it&#39;s the cheapest power you&#39;ll ever buy.</li>
 <li><strong>Treat a lucky-looking win from a tiny sample with suspicion.</strong> A +40% lift on 200 users per arm is far more likely to be noise than a real 40% effect.</li>
 </ul>
 <h2>The 60-second pre-flight checklist</h2>

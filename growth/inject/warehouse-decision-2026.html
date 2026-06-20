@@ -42,7 +42,7 @@
 <li><strong>Right-size, then commit.</strong> Start small, measure, scale up only when a workload proves it needs it. Once usage is predictable, buy commitments (Snowflake capacity, BigQuery Editions/commitments, Databricks committed-use) for meaningful discounts.</li>
 <li><strong>Attribute cost to teams.</strong> Per-warehouse / per-project / per-workspace tagging turns an opaque bill into a feedback loop the people generating the cost can actually act on.</li>
 </ol>
-<p>If you want platform-specific tactics, I&#39;ve written deep dives on <a href="bigquery-cut-bill">cutting a BigQuery bill</a> and the <a href="bigquery-antipatterns">BigQuery anti-patterns</a> that quietly inflate scan costs. And if your data is small enough that you&#39;re over-buying a warehouse at all, it&#39;s worth reading <a href="duckdb-vs-spark">DuckDB vs Spark</a> before you provision anything — not every problem needs a distributed warehouse.</p>
+<p>If you want platform-specific tactics, I&#39;ve written deep dives on cutting a BigQuery bill and the BigQuery anti-patterns that quietly inflate scan costs. And if your data is small enough that you&#39;re over-buying a warehouse at all, it&#39;s worth reading DuckDB vs Spark before you provision anything — not every problem needs a distributed warehouse.</p>
 <p><img src="https://raw.githubusercontent.com/dgenio/weaver-article-assets/main/growth/images/warehouse-decision-2026-d1.png" alt="Decision flowchart: from primary workload to recommended platform, with escape hatches for governance and multi-cloud constraints.">
 <em>Decision flowchart: from primary workload to recommended platform, with escape hatches for governance and multi-cloud constraints.</em></p>
 <h2>The honest trade-offs (when NOT to use each)</h2>

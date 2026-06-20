@@ -166,7 +166,7 @@ dbt build --select state:modified+ --defer --state ./prod-manifest
 <li><code>dbt build</code> interleaves runs and tests, so a model that fails its test won&#39;t poison its children within the same invocation.</li>
 <li><code>--defer</code> lets unchanged upstream models resolve to production, so you don&#39;t rebuild the whole warehouse on every PR.</li>
 </ul>
-<p>Because failed <code>error</code>-severity tests make dbt exit non-zero, your CI provider marks the check red and the merge is blocked. That&#39;s the whole game: <strong>bad data becomes a failed build, not a Monday incident.</strong> This pairs naturally with <a href="dbt-incremental">incremental models</a> — your CI run should exercise the incremental logic, not just a full refresh.</p>
+<p>Because failed <code>error</code>-severity tests make dbt exit non-zero, your CI provider marks the check red and the merge is blocked. That&#39;s the whole game: <strong>bad data becomes a failed build, not a Monday incident.</strong> This pairs naturally with incremental models — your CI run should exercise the incremental logic, not just a full refresh.</p>
 <h2>A minimum suite per layer</h2>
 <p>You don&#39;t need 40 tests on every model. You need the <em>right</em> tests at each layer, with guarantees tightening as data flows toward the people who consume it.</p>
 <p><strong>Sources (raw):</strong> freshness (<code>warn_after</code>/<code>error_after</code>), plus <code>not_null</code> and <code>unique</code> on the primary key. Catch ingestion problems at the door.</p>
@@ -183,7 +183,7 @@ dbt build --select state:modified+ --defer --state ./prod-manifest
 <li><strong>Don&#39;t mistake green tests for correct logic.</strong> Tests check the invariants you thought to write. They won&#39;t catch a wrong <code>JOIN</code> that still produces unique, non-null keys. Code review and a few targeted singular tests still matter.</li>
 </ul>
 <p>A reasonable target is the suite above: a handful of high-signal tests per model, all running in <code>dbt build</code>, gated in CI. That&#39;s the 20% of effort that prevents 80% of the Monday incidents.</p>
-<p>If you want to go further, the next frontier is generating and maintaining this suite with an assistant — I cover that in <a href="llm-dbt-tests">using an LLM to write dbt tests</a>.</p>
+<p>If you want to go further, the next frontier is generating and maintaining this suite with an assistant — I cover that in using an LLM to write dbt tests.</p>
 <h2>Takeaways</h2>
 <ul>
 <li><strong>A dbt test is just a query for the bad rows.</strong> Zero rows = pass. Internalize this and custom tests become trivial.</li>

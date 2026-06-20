@@ -55,7 +55,7 @@ SELECT user_id, event_name, event_date
 FROM `my_project.analytics.events`
 WHERE event_date = &quot;2026-06-01&quot;;
 </code></pre>
-<p>If you genuinely need to eyeball a wide table, <code>SELECT * ... LIMIT 10</code> does <strong>not</strong> save you money on a normal table — BigQuery still scans the full columns to satisfy the query (the <code>LIMIT</code> is applied after). Use the <strong>table preview</strong> tab in the console instead, which is free. (More on this and other traps in my companion piece on <a href="bigquery-antipatterns">BigQuery antipatterns</a>.)</p>
+<p>If you genuinely need to eyeball a wide table, <code>SELECT * ... LIMIT 10</code> does <strong>not</strong> save you money on a normal table — BigQuery still scans the full columns to satisfy the query (the <code>LIMIT</code> is applied after). Use the <strong>table preview</strong> tab in the console instead, which is free. (More on this and other traps in my companion piece on BigQuery antipatterns.)</p>
 <h2>Lever 2: Partition by date — the single biggest lever</h2>
 <p>If you remember one thing, remember this: <strong>partition your big tables by date.</strong></p>
 <p>Partitioning splits a table into segments (typically one per day) based on a column. When a query filters on that column, BigQuery prunes the partitions that can&#39;t match and scans only the rest. A query for one day out of two years of history scans roughly <strong>1/730th</strong> of the data instead of all of it. That&#39;s not a tuning tweak — it&#39;s an order-of-magnitude change in bytes scanned.</p>
@@ -156,7 +156,7 @@ SET OPTIONS (partition_expiration_days = 540);  -- keep ~18 months, drop older p
 <li><strong>BI Engine</strong> for dashboards that re-query on every click.</li>
 </ul>
 <p>None of this requires rewriting your analytics. It requires laying tables out so your existing queries touch less data.</p>
-<p>If you try one thing this week, make it the dry-run habit plus partitioning your single biggest table — that combination alone usually bends the cost curve. Got a BigQuery bill story or a lever I left out? Drop it in the comments, and follow for the companion piece on the <a href="bigquery-antipatterns">antipatterns</a> that quietly inflate scans.</p>
+<p>If you try one thing this week, make it the dry-run habit plus partitioning your single biggest table — that combination alone usually bends the cost curve. Got a BigQuery bill story or a lever I left out? Drop it in the comments, and follow for the companion piece on the antipatterns that quietly inflate scans.</p>
 <h2>FAQ</h2>
 <p><strong>Does BigQuery charge for rows returned or bytes scanned?</strong>
 On BigQuery&#39;s on-demand model you pay for bytes scanned, not rows returned. The US multi-region list price is $6.25 per TB, with the first 1 TB each month free. This is why a <code>SELECT *</code> against a 2 TB table costs the same whether you return one row or millions.</p>

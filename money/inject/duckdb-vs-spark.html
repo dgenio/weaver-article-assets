@@ -123,7 +123,7 @@ print(f&quot;DuckDB aggregate: {time.time() - t0:.2f}s&quot;)
 <li><strong>Heavy concurrent multi-user workloads.</strong> DuckDB is embedded and single-writer; it&#39;s not a shared cluster serving hundreds of concurrent analysts.</li>
 </ul>
 <p>The honest framing: <strong>size your data per job, not your ambitions.</strong> Most teams&#39; median job is far smaller than their largest, and they provision for the largest. The mid-data quadrant — the one most jobs actually live in — is where a single node quietly wins.</p>
-<p>If you&#39;re already rethinking single-node tooling, the same logic applies one layer down to your in-memory dataframes — I made the parallel case in <a href="polars-pandas">Polars vs pandas</a>, where the column-oriented, multi-threaded engine beats the row-oriented default for the same structural reasons.</p>
+<p>If you&#39;re already rethinking single-node tooling, the same logic applies one layer down to your in-memory dataframes — I made the parallel case in Polars vs pandas, where the column-oriented, multi-threaded engine beats the row-oriented default for the same structural reasons.</p>
 <h2>Takeaways</h2>
 <ul>
 <li><strong>Under ~100GB, default to a single node.</strong> A 64–128 core box with hundreds of GB of RAM handles far more than most &quot;big data&quot; jobs need.</li>

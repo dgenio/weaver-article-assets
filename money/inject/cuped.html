@@ -120,7 +120,7 @@ print(f&quot;var ratio = {df.Y_cuped.var(ddof=1)/df.Y.var(ddof=1):.4f}&quot;)
 <li><strong>The outcome is structurally new.</strong> Testing a brand-new feature whose usage has no pre-period analog: there&#39;s nothing historical that correlates with it.</li>
 <li><strong>Short pre-periods.</strong> A noisy one-day pre-window correlates poorly with the test-period metric. Longer, more stable pre-windows generally raise <code>rho</code> (up to a point).</li>
 </ul>
-<p>And two operational gotchas worth a sentence each: with very small samples, estimating <code>theta</code> itself adds a little noise (negligible at thousands of users, not at dozens). And CUPED reduces variance, it does not fix bias — it is not a substitute for clean randomization, SRM checks, or the other hygiene covered in <a href="ab-test-pitfalls">common A/B test pitfalls</a>. A tighter confidence interval around a biased estimate is worse than a wide one, not better.</p>
+<p>And two operational gotchas worth a sentence each: with very small samples, estimating <code>theta</code> itself adds a little noise (negligible at thousands of users, not at dozens). And CUPED reduces variance, it does not fix bias — it is not a substitute for clean randomization, SRM checks, or the other hygiene covered in common A/B test pitfalls. A tighter confidence interval around a biased estimate is worse than a wide one, not better.</p>
 <h2>Takeaways</h2>
 <ul>
 <li><strong>CUPED trades pre-experiment data for statistical power.</strong> Replace <code>Y</code> with <code>Y_cuped = Y - theta*(X - E[X])</code>, <code>theta = cov(X,Y)/var(X)</code>, then run your normal test.</li>
